@@ -1,0 +1,13 @@
+state/
+backups/
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.dpapi
+*.log
+control.token
+connection.json
+installation.json
+.venv/
