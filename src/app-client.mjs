@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
-import { defaultCodexHome } from './common.mjs';
+import { defaultCodexHome, VERSION } from './common.mjs';
 
 const ALLOWED = new Set(['list_threads', 'read_thread', 'send_message_to_thread']);
 export function findAppServer(home = defaultCodexHome()) {
@@ -36,7 +36,7 @@ export class AppClient {
       this.pending.delete(msg.id); clearTimeout(pending.timer);
       if (msg.error) pending.reject(Object.assign(new Error('Desktop request rejected'), {code:'DESKTOP_REJECTED'})); else pending.resolve(msg.result);
     });
-    await this.rpc('initialize', {protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'codex-wechat-task-router',version:'0.1.2'}});
+    await this.rpc('initialize', {protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'codex-wechat-task-router',version:VERSION}});
     this.child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
     const catalog = await this.rpc('tools/list', {});
     for (const suffix of ALLOWED) {

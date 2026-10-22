@@ -1,10 +1,14 @@
 import readline from 'node:readline';
 import { localApi, randomId, sleep, VERSION } from './common.mjs';
 import { DesktopWorker } from './desktop-worker.mjs';
+import {createBootstrap, watchService} from './bootstrap.mjs';
 
 const connectionId = `mcp-${randomId()}`;
 const running = new Map();
-const desktop = new DesktopWorker();
+const bootstrap=createBootstrap();
+const watchdog=watchService(bootstrap);
+const api=bootstrap.request;
+const desktop = new DesktopWorker({api});
 function connectDesktop(message) {
   if (!process.env.CODEX_APP_TOOLS_PIPE_PATH) return;
   let meta = message.params?._meta?.['x-codex-turn-metadata'];
@@ -25,19 +29,19 @@ function send(value) { process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', 
 const result = data => ({ content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data });
 async function callTool(message, state) {
   const { name, arguments: args = {} } = message.params;
-  if (name === 'get_status') return result({ ...(await localApi('/api/status', undefined, { signal: state.abort.signal, timeout: 3000 })), desktop_app_tools_available: !!process.env.CODEX_APP_TOOLS_PIPE_PATH });
+  if (name === 'get_status') return result({ ...(await api('/api/status', undefined, { signal: state.abort.signal, timeout: 3000 })), desktop_app_tools_available: !!process.env.CODEX_APP_TOOLS_PIPE_PATH, auto_start:watchdog.status() });
   if (name === 'check_answer') {
     if (!/^[0-9a-f-]{36}$/i.test(args.request_id || '')) throw new Error('Invalid request ID');
-    return result(await localApi(`/api/requests/${args.request_id}`, undefined, { signal: state.abort.signal, timeout: 3000 }));
+    return result(await api(`/api/requests/${args.request_id}`, undefined, { signal: state.abort.signal, timeout: 3000 }));
   }
   if (name !== 'ask_user') throw new Error('Unknown tool');
   const input = { ...args, session_id: args.session_id || process.env.CODEX_THREAD_ID || connectionId,
     turn_id: args.turn_id || '', request_key: args.request_key || `${connectionId}:${message.id}` };
-  let record = await localApi('/api/ask', input, { signal: state.abort.signal, timeout: 5000 }); state.requestId = record.id;
+  let record = await api('/api/ask', input, { signal: state.abort.signal, timeout: 5000 }); state.requestId = record.id;
   const deadline = Date.now() + 86340000;
   let failures = 0;
   while (record.status === 'pending' && Date.now() < deadline && !state.abort.signal.aborted) {
-    try { record = await localApi(`/api/requests/${record.id}/wait`, undefined, { signal: state.abort.signal, timeout: 25000 }); failures = 0; }
+    try { record = await api(`/api/requests/${record.id}/wait`, undefined, { signal: state.abort.signal, timeout: 25000 }); failures = 0; }
     catch (e) { if (state.abort.signal.aborted) throw e; if (++failures >= 4) throw Object.assign(new Error('Bridge disconnected; ask the user in Codex'), { code: 'BRIDGE_DISCONNECTED' }); await sleep(1000); }
     const progressToken = message.params?._meta?.progressToken;
     if (progressToken !== undefined && record.status === 'pending') send({ method: 'notifications/progress', params: { progressToken, progress: 0, message: '等待微信回答；未自动选择任何选项。' } });
@@ -74,6 +78,7 @@ lines.on('line', line => {
   try { const parsed = JSON.parse(line); onMessage(parsed).catch(() => {}); } catch { send({ id: null, error: { code: -32700, message: 'Parse error' } }); }
 });
 lines.on('close', async () => {
+  watchdog.close();
   await desktop.close();
   for (const state of running.values()) { state.abort.abort(); if (state.requestId) await localApi(`/api/requests/${state.requestId}/cancel`, {}, { timeout: 1000 }).catch(() => {}); }
 });

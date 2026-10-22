@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const VERSION = '0.1.2';
+export const VERSION = '0.1.3';
 export const STATE = process.env.CODEX_WECHAT_STATE || path.join(ROOT, 'state');
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const randomId = () => crypto.randomUUID();
