@@ -1,0 +1,30 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { ROOT, atomicWrite } from '../src/common.mjs';
+const version = '1.4.4';
+const metaResponse = await fetch(`https://registry.npmjs.org/qrcode-generator/${version}`, { signal: AbortSignal.timeout(20000), redirect: 'error' });
+if (!metaResponse.ok) throw new Error(`Registry HTTP ${metaResponse.status}`);
+const meta = await metaResponse.json();
+const tarUrl = `https://registry.npmjs.org/qrcode-generator/-/qrcode-generator-${version}.tgz`;
+if (meta.dist.tarball !== tarUrl) throw new Error('Unexpected package URL');
+const response = await fetch(tarUrl, { signal: AbortSignal.timeout(20000), redirect: 'error' });
+if (!response.ok) throw new Error(`Package HTTP ${response.status}`);
+const archive = Buffer.from(await response.arrayBuffer());
+const digest = `sha512-${crypto.createHash('sha512').update(archive).digest('base64')}`;
+if (digest !== meta.dist.integrity) throw new Error('Package integrity mismatch');
+const tar = zlib.gunzipSync(archive); const files = new Map();
+for (let pos = 0; pos + 512 <= tar.length;) {
+  const header = tar.subarray(pos, pos + 512); if (header.every(x => x === 0)) break;
+  const name = header.subarray(0, 100).toString().replace(/\0.*$/, '');
+  const size = parseInt(header.subarray(124, 136).toString().replace(/\0.*$/, '').trim() || '0', 8);
+  if (!Number.isFinite(size) || size < 0 || pos + 512 + size > tar.length) throw new Error('Malformed package archive');
+  if (name === 'package/qrcode.js' || name === 'package/README.md') files.set(name, tar.subarray(pos + 512, pos + 512 + size));
+  pos += 512 + Math.ceil(size / 512) * 512;
+}
+if (!files.has('package/qrcode.js')) throw new Error('QR module missing');
+atomicWrite(path.join(ROOT, 'vendor', 'qrcode.cjs'), files.get('package/qrcode.js'));
+atomicWrite(path.join(ROOT, 'vendor', 'qrcode-README.md'), files.get('package/README.md') || '');
+atomicWrite(path.join(ROOT, 'vendor', 'package-integrity.json'), JSON.stringify({ name: meta.name, version, license: meta.license, url: tarUrl, integrity: digest }, null, 2));
+console.log(JSON.stringify({ installed: 'vendor/qrcode.cjs', version, integrity_verified: true }));
