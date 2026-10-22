@@ -28,5 +28,6 @@ if (-not $taskAclCorrect) {
   }
   Set-Acl -LiteralPath $taskTarget -AclObject $taskAcl
 }
+& (Join-Path $taskTarget 'scripts\service-task.ps1') -Action Install -AtLogon:(!$NoAutostart)
 if (-not $NoStart) { & (Join-Path $taskTarget 'start.ps1') }
 Write-Output 'Local files installed. Pair WeChat and check hook trust; use Codex /hooks only if review is requested.'
