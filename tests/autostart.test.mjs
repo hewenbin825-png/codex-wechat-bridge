@@ -5,10 +5,26 @@ import os from 'node:os';
 import path from 'node:path';
 import {createBootstrap, watchService} from '../src/bootstrap.mjs';
 import {handleHook} from '../src/hook.mjs';
-import {sleep} from '../src/common.mjs';
+import {sleep,ROOT,VERSION,localApi} from '../src/common.mjs';
+import {spawn} from 'node:child_process';
 
 const refused=()=>Object.assign(new TypeError('fetch failed'),{cause:{code:'ECONNREFUSED'}});
 function fixture(){return fs.mkdtempSync(path.join(os.tmpdir(),'codex-wechat-start-'));}
+
+test('Windows launcher starts a fresh unpaired installation without pre-existing connection or token files',{skip:process.platform!=='win32'},async()=>{
+  const root=fixture(),state=path.join(root,'state');fs.mkdirSync(state);fs.mkdirSync(path.join(root,'scripts'));
+  for(const dir of ['src','ui','vendor'])fs.cpSync(path.join(ROOT,dir),path.join(root,dir),{recursive:true});
+  fs.copyFileSync(path.join(ROOT,'scripts','run-service.ps1'),path.join(root,'scripts','run-service.ps1'));
+  fs.writeFileSync(path.join(root,'installation.json'),JSON.stringify({owner:'codex-wechat-bridge',version:VERSION,node:process.execPath}));
+  assert.equal(fs.existsSync(path.join(state,'connection.json')),false);assert.equal(fs.existsSync(path.join(state,'control.token')),false);
+  const shell=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+  let started=false;
+  try {
+    const code=await new Promise((resolve,reject)=>{const child=spawn(shell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',path.join(root,'scripts','run-service.ps1')],{windowsHide:true,env:{...process.env,CODEX_WECHAT_STATE:state,CODEX_WECHAT_PORT:'0',CODEX_HOME:path.join(root,'empty-codex-home')},stdio:['ignore','ignore','pipe']});child.stderr.resume();child.on('error',reject);child.on('exit',resolve);});
+    started=fs.existsSync(path.join(state,'connection.json'));assert.equal(code,0);assert.ok(started);
+    const result=await localApi('/api/status',undefined,{state,timeout:3000});assert.equal(result.version,VERSION);assert.equal(result.paired,false);
+  } finally {if(started)await localApi('/api/shutdown',{}, {state,timeout:3000});}
+});
 test('an already running service is reused and simultaneous startup requests launch once',async()=>{
   const state=fixture();let ready=true,launches=0;
   const b=createBootstrap({state,api:async()=>{if(!ready)throw refused();return{version:'test'};},launch:async()=>{launches++;await sleep(15);ready=true;}});
