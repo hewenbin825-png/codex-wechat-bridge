@@ -1,6 +1,6 @@
 {
   "name": "codex-wechat-bridge",
-  "version": "0.1.4",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "Local-only WeChat notifications and authenticated answers for existing Codex chats",
