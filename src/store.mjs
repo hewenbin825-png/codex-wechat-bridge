@@ -13,16 +13,21 @@ export class Store {
       CREATE TABLE IF NOT EXISTS inbound (id TEXT PRIMARY KEY, received INTEGER);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE IF NOT EXISTS tasks (number INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT UNIQUE NOT NULL, title TEXT, cwd TEXT, state TEXT NOT NULL, last_turn TEXT, completed INTEGER, updated INTEGER);
+      CREATE TABLE IF NOT EXISTS task_number_history (epoch INTEGER,number INTEGER,session_id TEXT,title TEXT,cwd TEXT,state TEXT,last_turn TEXT,completed INTEGER,updated INTEGER,retired INTEGER,PRIMARY KEY(epoch,number));
       CREATE TABLE IF NOT EXISTS task_completions (session_id TEXT, turn_id TEXT, PRIMARY KEY(session_id,turn_id));
       CREATE TABLE IF NOT EXISTS continuations (id TEXT PRIMARY KEY, inbound_id TEXT UNIQUE, task_number INTEGER, session_id TEXT, prompt TEXT, state TEXT, created INTEGER, updated INTEGER, worker_id TEXT, error TEXT);
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, time INTEGER, event TEXT, details TEXT);`);
+    if (!this.db.prepare('PRAGMA table_info(requests)').all().some(c=>c.name==='local_available')) this.db.exec('ALTER TABLE requests ADD COLUMN local_available INTEGER NOT NULL DEFAULT 0');
+    if (!this.db.prepare('PRAGMA table_info(requests)').all().some(c=>c.name==='question_epoch')) this.db.exec('ALTER TABLE requests ADD COLUMN question_epoch INTEGER NOT NULL DEFAULT 0');
+    if (!this.db.prepare('PRAGMA table_info(continuations)').all().some(c=>c.name==='question_number')) this.db.exec('ALTER TABLE continuations ADD COLUMN question_number INTEGER');
+    if (!this.db.prepare('PRAGMA table_info(continuations)').all().some(c=>c.name==='task_epoch')) this.db.exec('ALTER TABLE continuations ADD COLUMN task_epoch INTEGER NOT NULL DEFAULT 0');
     // A process can die after send acceptance; do not blindly resend that record.
     this.db.prepare("UPDATE outbox SET state='uncertain', error='PROCESS_RESTART_DURING_SEND' WHERE state='sending'").run();
-    this.db.prepare("UPDATE tasks SET state='uncertain' WHERE number IN (SELECT task_number FROM continuations WHERE state='dispatching')").run();
+    this.db.prepare("UPDATE tasks SET state='uncertain' WHERE EXISTS (SELECT 1 FROM continuations c WHERE c.state='dispatching' AND c.task_number=tasks.number AND c.session_id=tasks.session_id AND c.task_epoch=?)").run(Number(this.meta('task_epoch')||0));
     this.db.prepare("UPDATE continuations SET state='uncertain',error='PROCESS_RESTART_DURING_DISPATCH',prompt='' WHERE state='dispatching'").run();
     // Question numbers remain stable across answers and service restarts, including concurrent chats.
     let counter = Number(this.meta('question_counter') || 0);
-    const rows = this.db.prepare('SELECT id,status,questions FROM requests ORDER BY created,rowid').all();
+    const rows = this.db.prepare('SELECT id,status,questions FROM requests WHERE question_epoch=? ORDER BY created,rowid').all(Number(this.meta('question_epoch')||0));
     for (const row of rows) for (const q of JSON.parse(row.questions)) if (Number.isSafeInteger(q.number) && q.number > counter) counter = q.number;
     for (const row of rows) {
       if (row.status !== 'pending') continue;
@@ -47,12 +52,15 @@ export class Store {
   sessionTitle(id) { return this.db.prepare('SELECT title,cwd FROM sessions WHERE id=?').get(id); }
   tasks() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number=?').get(number); }
+  taskForSession(session) { return this.db.prepare('SELECT * FROM tasks WHERE session_id=?').get(session); }
   completeTask(session, turn, title, cwd = '') {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const added = this.db.prepare('INSERT OR IGNORE INTO task_completions VALUES (?,?)').run(session, turn).changes;
-      if (added) this.db.prepare("INSERT INTO tasks(session_id,title,cwd,state,last_turn,completed,updated) VALUES (?,?,?,'completed',?,?,?) ON CONFLICT(session_id) DO UPDATE SET title=excluded.title,cwd=excluded.cwd,state='completed',last_turn=excluded.last_turn,completed=excluded.completed,updated=excluded.updated")
-        .run(session, title, cwd, turn, this.clock(), this.clock());
+      if (added) {
+        if(this.taskForSession(session))this.db.prepare("UPDATE tasks SET title=?,cwd=?,state='completed',last_turn=?,completed=?,updated=? WHERE session_id=?").run(title,cwd,turn,this.clock(),this.clock(),session);
+        else this.db.prepare("INSERT INTO tasks(session_id,title,cwd,state,last_turn,completed,updated) VALUES (?,?,?,'completed',?,?,?)").run(session,title,cwd,turn,this.clock(),this.clock());
+      }
       const task = this.db.prepare('SELECT * FROM tasks WHERE session_id=?').get(session);
       this.db.exec('COMMIT'); return { task, duplicate: !added };
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
@@ -61,13 +69,30 @@ export class Store {
     const id = randomId(), at = this.clock();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const changed = this.db.prepare("UPDATE tasks SET state='queued',updated=? WHERE number=? AND state='completed'").run(at, task.number).changes;
+      const changed = this.db.prepare("UPDATE tasks SET state='queued',updated=? WHERE number=? AND session_id=? AND state='completed'").run(at, task.number,task.session_id).changes;
       if (!changed) { this.db.exec('COMMIT'); return null; }
       this.db.prepare("INSERT INTO continuations(id,inbound_id,task_number,session_id,prompt,state,created,updated) VALUES (?,?,?,?,?,'queued',?,?)").run(id, inbound, task.number, task.session_id, prompt, at, at);
+      this.db.prepare('UPDATE continuations SET task_epoch=? WHERE id=?').run(Number(this.meta('task_epoch')||0),id);
       this.db.exec('COMMIT'); return this.continuation(id);
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
   continuation(id) { return this.db.prepare('SELECT * FROM continuations WHERE id=?').get(id); }
+  questionByNumber(number) {
+    if (!Number.isSafeInteger(number) || number<1) return null;
+    for (const row of this.db.prepare('SELECT id FROM requests WHERE question_epoch=? ORDER BY created DESC').all(Number(this.meta('question_epoch')||0))) {
+      const request=this.request(row.id),question=request.questions.find(q=>q.number===number);
+      if (question) return {request,question};
+    }
+    return null;
+  }
+  enqueueQuestionSupplement(request,question,prompt,inbound) {
+    const id=randomId(),at=this.clock();
+    const result=this.db.prepare("INSERT OR IGNORE INTO continuations(id,inbound_id,task_number,session_id,prompt,state,created,updated,question_number) VALUES (?,?,NULL,?,?,'queued',?,?,?)")
+      .run(id,inbound,request.session_id,`【第${question.number}题的后续补充】\n${prompt}`,at,at,question.number);
+    if (!result.changes) return null;
+    this.db.prepare('UPDATE continuations SET task_epoch=? WHERE id=?').run(Number(this.meta('task_epoch')||0),id);
+    this.audit('question_supplement_queued',{number:question.number});return this.continuation(id);
+  }
   claimContinuation(worker) {
     const row = this.db.prepare("SELECT * FROM continuations WHERE state='queued' ORDER BY created LIMIT 1").get();
     if (!row) return null;
@@ -80,7 +105,7 @@ export class Store {
     if (!row || row.state !== 'dispatching' || row.worker_id !== worker) return null;
     this.db.prepare('UPDATE continuations SET state=?,error=?,prompt=\'\',updated=? WHERE id=?').run(state, error.slice(0, 64), this.clock(), id);
     // A later completion may already have arrived; do not overwrite its state.
-    this.db.prepare("UPDATE tasks SET state=?,updated=? WHERE number=? AND state='queued'").run(state === 'delivered' ? 'active' : state === 'uncertain' ? 'uncertain' : 'completed', this.clock(), row.task_number);
+    if(row.task_epoch===Number(this.meta('task_epoch')||0))this.db.prepare("UPDATE tasks SET state=?,updated=? WHERE number=? AND session_id=? AND state='queued'").run(state === 'delivered' ? 'active' : state === 'uncertain' ? 'uncertain' : 'completed', this.clock(), row.task_number,row.session_id);
     this.audit('continuation_result', { task: row.task_number, state, error: error.slice(0, 64) });
     return row;
   }
@@ -98,7 +123,7 @@ export class Store {
   }
   byKey(key) { const row = this.db.prepare('SELECT id FROM requests WHERE request_key=?').get(key); return row && this.request(row.id); }
   pending() { this.sweep(); return this.db.prepare("SELECT id FROM requests WHERE status='pending' ORDER BY created").all().map(r => this.request(r.id)); }
-  createRequest({ request_key, session_id, turn_id = '', title = '', questions, ttl_ms = 86400000 }) {
+  createRequest({ request_key, session_id, turn_id = '', title = '', questions, ttl_ms = 86400000, local_available = false }) {
     const existing = this.byKey(request_key); if (existing) return existing;
     if (!Array.isArray(questions) || !questions.length || questions.length > 3) throw new Error('需要 1–3 道问题');
     const ids = new Set();
@@ -118,6 +143,7 @@ export class Store {
     const id = randomId(), at = this.clock();
     this.db.prepare('INSERT INTO requests(id,request_key,session_id,turn_id,title,questions,status,created,expires,lease) VALUES (?,?,?,?,?,?,\'pending\',?,?,?)')
       .run(id, request_key, session_id, turn_id, summary(title, 40), JSON.stringify(normalized), at, at + Math.min(Math.max(ttl_ms, 60000), 86400000), at + 90000);
+    this.db.prepare('UPDATE requests SET local_available=?,question_epoch=? WHERE id=?').run(local_available ? 1 : 0,Number(this.meta('question_epoch')||0),id);
     this.audit('question_created', { id, count: normalized.length });
     return this.request(id);
   }
@@ -129,6 +155,25 @@ export class Store {
   cancelSession(session, turn = '') {
     for (const r of this.pending()) if (r.session_id === session && (!turn || r.turn_id === turn)) this.cancel(r.id);
   }
+  clearQuestions() {
+    this.sweep();this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows=this.db.prepare("SELECT id,questions,answers FROM requests WHERE status='pending'").all();
+      const count=rows.reduce((n,r)=>n+JSON.parse(r.questions).filter(q=>!JSON.parse(r.answers)[q.id]).length,0);
+      for(const r of rows)this.cancel(r.id);
+      const at=this.clock(),epoch=Number(this.meta('question_epoch')||0)+1,taskEpoch=Number(this.meta('task_epoch')||0);
+      this.meta('question_epoch',epoch);this.meta('question_counter',0);this.meta('question_reset_at',at);
+      const supplements=this.db.prepare("SELECT count(*) AS n FROM continuations WHERE question_number IS NOT NULL AND state='queued'").get().n;
+      const continuations=this.db.prepare("UPDATE continuations SET state='cancelled',prompt='',error='NUMBERS_CLEARED',updated=? WHERE state='queued'").run(at).changes;
+      const retired=this.db.prepare('INSERT INTO task_number_history SELECT ?,number,session_id,title,cwd,state,last_turn,completed,updated,? FROM tasks').run(taskEpoch,at).changes;
+      this.db.exec("DELETE FROM tasks; DELETE FROM sqlite_sequence WHERE name='tasks'");
+      this.meta('task_epoch',taskEpoch+1);this.meta('task_reset_at',at);
+      if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dot_requests'").get())this.db.exec('UPDATE dot_requests SET task_number=NULL');
+      this.db.prepare("UPDATE outbox SET state='cancelled' WHERE state IN ('queued','deferred') AND (kind='completion' OR (kind='receipt' AND (event_key LIKE 'dot-bound:%' OR event_key LIKE 'continuation-result:%')))").run();
+      this.audit('questions_cleared',{pending_questions:count,queued_supplements_cancelled:supplements,queued_continuations_cancelled:continuations,retired_tasks:retired,epoch,task_epoch:taskEpoch+1});
+      this.db.exec('COMMIT');return {pending_questions:count,queued_supplements_cancelled:supplements,queued_continuations_cancelled:continuations,retired_tasks:retired,next_question_number:1,next_task_number:1};
+    }catch(e){this.db.exec('ROLLBACK');throw e;}
+  }
   sweep() {
     const at = this.clock();
     const stale = this.db.prepare("SELECT id FROM requests WHERE status='pending' AND (expires<=? OR lease<=?)").all(at, at);
@@ -136,14 +181,21 @@ export class Store {
     this.db.prepare("UPDATE outbox SET state='expired' WHERE state IN ('queued','deferred') AND expires<=?").run(at);
   }
   acceptInbound(id) { return this.db.prepare('INSERT OR IGNORE INTO inbound VALUES (?,?)').run(id, this.clock()).changes === 1; }
-  answer(requestId, q, text, messageId) {
+  answer(requestId, q, text, messageId, source = 'wechat') {
+    this.sweep();
+    if (!['wechat','local','codex'].includes(source)) throw new Error('Invalid answer source');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
     const r = this.request(requestId);
-    if (!r || r.status !== 'pending' || r.answers[q.id]) return false;
-    r.answers[q.id] = { answers: [text], source: 'wechat', message_id: messageId, received_at: this.clock() };
+    if (!r || r.status !== 'pending' || !r.questions.some(x=>x.id===q.id) || r.answers[q.id]) {this.db.exec('COMMIT');return false;}
+    r.answers[q.id] = { answers: [text], source, message_id: messageId, received_at: this.clock() };
     const done = r.questions.every(x => r.answers[x.id]);
     this.db.prepare('UPDATE requests SET answers=?,status=? WHERE id=? AND status=\'pending\'').run(JSON.stringify(r.answers), done ? 'answered' : 'pending', r.id);
-    this.audit('question_answered', { id: r.id, question_id: q.id, complete: done });
+    this.db.prepare("UPDATE outbox SET state='cancelled' WHERE event_key=? AND state IN ('queued','deferred')").run(`question:${r.id}:${q.id}`);
+    this.audit('question_answered', { id: r.id, question_id: q.id, complete: done,source });
+    this.db.exec('COMMIT');
     return true;
+    } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }
   enqueue({ key, kind = 'completion', request_id = '', peer, text, ttl_ms = 86400000 }) {
     const id = randomId(), at = this.clock();
@@ -176,7 +228,7 @@ export class Store {
 
 export function questionMessage(request, q) {
   return `【${request.title || 'Codex 等待回答'}】\n第${q.number}题：${q.question}\n` + q.options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
-    + `\n单题直接回数字或文字；多题回「${q.number}.1」或「${q.number}.你的文字」。`;
+    + `\n微信或电脑均可回答，先收到的有效答案生效。单题直接回数字或文字；多题回「${q.number}.1」或「${q.number}.你的文字」。答完仍可发「${q.number}.补充内容」。`;
 }
 
 export function resolveReply(pending, raw, createdAt = Date.now()) {
@@ -190,7 +242,7 @@ export function resolveReply(pending, raw, createdAt = Date.now()) {
   else if (numbered) { target = available.find(x => x.q.number === Number(numbered[1])); text = numbered[2].trim(); }
   else if (available.length === 1 && !/^Q[0-9A-F]{8}\b/i.test(text)) target = available[0];
   if (!target) return { ok: false, reason: !available.length ? '当前没有待答问题。已提交的答案无需重复回复。' : numbered || match ? '这道题已回答、已失效或题号不存在。发送「待答」查看当前题号。' : `同时有多道问题，请回复「题号.选项」或「题号.你的文字」，例如 ${available[0].q.number}.1。发送「待答」查看。` };
-  if (createdAt < target.r.created - 5000) return { ok: false, reason: '这条消息早于问题，未作为答案。请重新回复。' };
+  if (createdAt < target.r.created - (target.r.question_epoch>0?0:5000)) return { ok: false, reason: '这条消息早于问题，未作为答案。请重新回复。' };
   const custom = /^自定义\s*[:：]\s*([\s\S]+)$/i.exec(text);
   if (custom) text = custom[1].trim();
   else if (/^\d+$/.test(text) && target.q.options.length) {

@@ -1,10 +1,18 @@
 import { summary } from './common.mjs';
 
+export function clearCommand(raw) {
+  let text=String(raw).trim();
+  if(/^[（(]\s*\/[\s\S]*[）)]$/.test(text))text=text.slice(1,-1).trim();
+  if(!/^\/clear(?:\s|$)/i.test(text))return null;
+  return /^\/clear$/i.test(text)?{clear:true}:{error:'清理题号和任务号请单独发送 /clear；工作聊天与历史保留。'};
+}
+
 // A slash is mandatory: ordinary question answers never enter this parser.
 export function continuationCommand(raw, tasks) {
   let text = String(raw).trim();
   if (/^[（(]\s*\/[\s\S]*[）)]$/.test(text)) text = text.slice(1, -1).trim();
   if (!text.startsWith('/')) return null;
+  if(clearCommand(text))return {error:' /clear 是清理题号和任务号的保留命令，不作为任务续办提示词。'};
   const body = text.slice(1).trim();
   if (['任务', '任务列表', 'tasks'].includes(body)) return { list: true };
   if (!body) return { error: '请发送「/任务号 下一步要求」，例如 /1 继续任务。' };

@@ -32,19 +32,23 @@ export class DesktopWorker {
   connect(session) {
     if (this.closed || this.client || this.starting || this.clock() < this.retryAt || !/^[0-9a-f-]{36}$/i.test(session || '')) return;
     this.session = session;
+    if(!this.timer){this.timer=setInterval(()=>this.tick().catch(()=>{}),3000);this.timer.unref();}
     this.starting = (async () => {
       const client = this.clientFactory(session);
-      try { await client.start(); if (this.closed) { await client.close(); return; } this.client = client; this.monitor = new CompletionMonitor(client,this.api,this.clock); this.timer = setInterval(() => this.tick().catch(() => {}),3000); this.timer.unref(); await this.tick(); }
+      try { await client.start(); if (this.closed) { await client.close(); return; } this.client = client; this.monitor = new CompletionMonitor(client,this.api,this.clock); clearInterval(this.timer); this.timer = setInterval(() => this.tick().catch(() => {}),3000); this.timer.unref(); await this.tick(); }
       catch (e) { await client.close(); this.client = null; this.retryAt = this.clock()+30000; this.error = safeError(e); }
       finally { this.starting = null; }
     })();
   }
   async tick() {
-    if (this.busy || this.closed || !this.client) return;
+    if (this.busy || this.closed) return;
+    if(!this.client){this.connect(this.session);return;}
     this.busy = true;
+    let verifying=false;
     try {
-      if (this.client.healthy && !this.client.healthy()) await this.client.call('list_threads',{limit:1});
-      const registration = await this.api('/api/desktop/register',{worker_id:this.id,session_id:this.session,verified_at:this.client.verifiedAt || this.clock()},{timeout:2500});
+      // Renew well before the 20 second server lease expires.
+      if (this.client.healthy && !this.client.healthy(10000)) {verifying=true;await this.client.call('list_threads',{limit:1});verifying=false;}
+      const registration = await this.api('/api/desktop/register',{worker_id:this.id,session_id:this.session,verified_at:this.client.verifiedAt || this.clock(),capabilities:{create_codex_threads:this.client.supports?.('create_thread')===true}},{timeout:2500});
       if (!registration.active) return;
       const poll = await this.api('/api/desktop/poll',{worker_id:this.id,busy:this.dispatching},{timeout:2500});
       if (poll.job && !this.dispatching) { this.dispatching = true; this.delivery = this.dispatch(poll.job).finally(() => {this.dispatching=false;}); }
@@ -52,15 +56,24 @@ export class DesktopWorker {
         this.lastScan = this.clock(); this.scanning = true;
         this.scan = this.monitor.scan(registration.sessions).catch(e => {this.error=safeError(e);}).finally(() => {this.scanning=false;});
       }
-    } catch (e) { this.error = safeError(e); }
+    } catch (e) {
+      this.error = safeError(e);
+      // Reopen only the inherited official capability, never replay work.
+      if(verifying&&!this.dispatching){const client=this.client;this.client=null;this.retryAt=this.clock()+30000;await client.close().catch(()=>{});}
+    }
     finally { this.busy = false; }
   }
   async dispatch(job) {
-    let state = 'delivered', error = '';
+    let state = 'delivered', error = '',session_id=job.session_id;
     try {
-      await this.client.call('send_message_to_thread',{threadId:job.session_id,hostId:'local',prompt:job.prompt});
+      if(job.kind==='dot_work'&&!['create','continue'].includes(job.action))throw Object.assign(new Error('Invalid native action'),{code:'INVALID_NATIVE_ACTION',preflight:true});
+      if(job.kind==='dot_work'&&job.action==='create'){
+        const created=await this.client.call('create_thread',{prompt:job.prompt,title:job.title,target:{type:'projectless',directoryName:job.directory_name}});
+        if(!/^[0-9a-f-]{36}$/i.test(created.threadId||'')||created.clientThreadId||(created.hostId&&created.hostId!=='local'))throw Object.assign(new Error('Actual local threadId not yet confirmed'),{code:'CODEX_CREATION_UNCONFIRMED'});
+        session_id=created.threadId;
+      }else await this.client.call('send_message_to_thread',{threadId:job.session_id,hostId:'local',prompt:job.prompt});
     } catch (e) { state = e.preflight ? 'failed' : 'uncertain'; error = String(e.code || 'DESKTOP_DISPATCH_FAILED'); }
-    await this.api('/api/desktop/result',{worker_id:this.id,id:job.id,state,error},{timeout:3000}).catch(() => {});
+    await this.api('/api/desktop/result',{worker_id:this.id,id:job.id,state,error,...(job.kind==='dot_work'?{kind:job.kind,session_id}: {})},{timeout:3000}).catch(() => {});
   }
-  async close() { this.closed = true; clearInterval(this.timer); await this.client?.close(); await this.starting; }
+  async close() { this.closed = true; clearInterval(this.timer);await this.api('/api/desktop/unregister',{worker_id:this.id},{timeout:1000}).catch(()=>{}); await this.client?.close(); await this.starting; }
 }

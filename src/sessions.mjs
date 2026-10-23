@@ -17,7 +17,7 @@ function read(fn) {
 }
 export function lookupSession(id) {
   try {
-    const row = read(db => db.prepare('SELECT id,title,cwd,source,agent_path,agent_role,archived FROM threads WHERE id=?').get(id));
+    const row = read(db => db.prepare('SELECT id,title,cwd,source,agent_path,agent_role,archived,created_at FROM threads WHERE id=?').get(id));
     return row ? { ...row, root: isRootSession(row) } : null;
   } catch { return null; }
 }

@@ -10,9 +10,10 @@ import { WeChatApi } from './wechat.mjs';
 import { Bridge } from './bridge.mjs';
 import { lookupSession, monitorSessions } from './sessions.mjs';
 import { DesktopHub } from './desktop-hub.mjs';
+import {DotRouter} from './dot-router.mjs';
 
 export function lookupTitle(session) { return lookupSession(session)?.title || ''; }
-export async function serve({ state = STATE, port = 17349, bridge: supplied, listen = true } = {}) {
+export async function serve({ state = STATE, port = 17349, bridge: supplied, listen = true, dotVault, dotWebhook } = {}) {
   fs.mkdirSync(state, { recursive: true }); fs.mkdirSync(path.join(state, 'spool'), { recursive: true });
   const tokenPath = path.join(state, 'control.token');
   if (!fs.existsSync(tokenPath)) atomicWrite(tokenPath, crypto.randomBytes(32).toString('hex'));
@@ -20,6 +21,9 @@ export async function serve({ state = STATE, port = 17349, bridge: supplied, lis
   const store = supplied?.store || new Store(path.join(state, 'bridge.sqlite'));
   const bridge = supplied || await new Bridge({ store, api: new WeChatApi(), vault: new WindowsVault(state), sessionLookup: lookupSession }).init();
   const desktop = new DesktopHub(bridge, supplied ? () => [] : monitorSessions);
+  let dot;
+  try {dot=await new DotRouter({bridge,store,vault:dotVault||new WindowsVault(path.join(state,'dot')),webhook:dotWebhook}).init();}
+  catch(e){bridge.dot=null;store.audit('dot_startup_error',safeError(e));}
   const html = fs.readFileSync(path.join(ROOT, 'ui', 'index.html'));
   const script = fs.readFileSync(path.join(ROOT, 'ui', 'app.js'));
   const json = (res, status, data) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
@@ -40,7 +44,13 @@ export async function serve({ state = STATE, port = 17349, bridge: supplied, lis
     const presented = (req.headers.authorization || '').replace(/^Bearer /, '');
     if (!crypto.timingSafeEqual(crypto.createHash('sha256').update(presented).digest(), crypto.createHash('sha256').update(token).digest())) return json(res, 401, { error: 'Local authorization required' });
     try {
-      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, bridge.status());
+      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, bridge.status(url.searchParams.get('session_id')||''));
+      if (url.pathname.startsWith('/api/dot/')) {
+        if(!dot)return json(res,503,{error:'Dot connector unavailable; existing WeChat flow remains available'});
+        if(req.method==='GET'&&url.pathname==='/api/dot/status')return json(res,200,dot.status());
+        if(req.method==='POST'&&url.pathname==='/api/dot/configure')return json(res,200,dot.configure(await readBody(req)));
+        if(req.method==='POST'&&url.pathname==='/api/dot/rpc')return json(res,200,await dot.rpc(await readBody(req)));
+      }
       if (req.method === 'POST' && url.pathname === '/api/login/start') { await readBody(req); return json(res, 200, await bridge.startLogin()); }
       if (req.method === 'POST' && url.pathname === '/api/login/verify') {
         const body = await readBody(req);
@@ -59,13 +69,15 @@ export async function serve({ state = STATE, port = 17349, bridge: supplied, lis
       }
       if (req.method === 'POST' && url.pathname === '/api/events') return json(res, 200, bridge.event(await readBody(req)));
       if (req.method === 'POST' && url.pathname === '/api/desktop/register') return json(res, 200, desktop.register(await readBody(req)));
+      if (req.method === 'POST' && url.pathname === '/api/desktop/unregister') return json(res,200,desktop.unregister(await readBody(req)));
       if (req.method === 'POST' && url.pathname === '/api/desktop/poll') return json(res, 200, desktop.poll(await readBody(req)));
       if (req.method === 'POST' && url.pathname === '/api/desktop/result') return json(res, 200, desktop.result(await readBody(req)));
       if (req.method === 'POST' && url.pathname === '/api/ask') return json(res, 200, bridge.ask(await readBody(req)));
-      const match = /^\/api\/requests\/([0-9a-f-]{36})(\/wait|\/cancel)?$/.exec(url.pathname);
+      const match = /^\/api\/requests\/([0-9a-f-]{36})(\/wait|\/cancel|\/answer)?$/.exec(url.pathname);
       if (match) {
         if (!store.request(match[1])) return json(res, 404, { error: 'Unknown request' });
-        if (req.method === 'POST' && match[2] === '/cancel') { await readBody(req); store.cancel(match[1]); return json(res, 200, { ok: true }); }
+        if (req.method === 'POST' && match[2] === '/cancel') { await readBody(req); store.cancel(match[1]); bridge.emit('changed'); return json(res, 200, { ok: true }); }
+        if (req.method === 'POST' && match[2] === '/answer') return json(res,200,bridge.answerLocal(match[1],await readBody(req)));
         if (req.method === 'GET') {
           store.renew(match[1]); store.sweep();
           if (match[2] === '/wait' && store.request(match[1]).status === 'pending') {
@@ -93,12 +105,13 @@ export async function serve({ state = STATE, port = 17349, bridge: supplied, lis
         catch (e) { store.audit('spool_error', safeError(e)); }
       }
       await bridge.drainOnce();
+      dot?.tick().catch(e=>store.audit('dot_delivery_error',safeError(e)));
     } catch (e) { store.audit('service_tick_error', safeError(e)); }
   };
   const timer = setInterval(tick, 1000); const cleanup = setInterval(() => store.prune(), 3600000);
   const pollPromise = listen ? bridge.pollLoop() : Promise.resolve();
   async function close() {
-    if (closing) return; closing = true; clearInterval(timer); clearInterval(cleanup); await bridge.close();
+    if (closing) return; closing = true; clearInterval(timer); clearInterval(cleanup); await bridge.close();await dot?.close();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     await Promise.race([pollPromise, sleep(1200)]); store.close();
   }

@@ -4,7 +4,8 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { defaultCodexHome, VERSION } from './common.mjs';
 
-const ALLOWED = new Set(['list_threads', 'read_thread', 'send_message_to_thread']);
+const REQUIRED = new Set(['list_threads', 'read_thread', 'send_message_to_thread']);
+const ALLOWED = new Set([...REQUIRED,'create_thread']);
 export function findAppServer(home = defaultCodexHome()) {
   const base = path.join(home, 'plugins', 'cache', 'openai-bundled', 'codex-app-tools');
   try {
@@ -41,13 +42,14 @@ export class AppClient {
     const catalog = await this.rpc('tools/list', {});
     for (const suffix of ALLOWED) {
       const matches = catalog.tools.filter(t => t.name === suffix || t.name.endsWith(`__${suffix}`));
-      if (matches.length !== 1) throw Object.assign(new Error('Desktop tool unavailable'), {code:'DESKTOP_TOOL_UNAVAILABLE',preflight:true});
+      if (matches.length !== 1) {if(REQUIRED.has(suffix))throw Object.assign(new Error('Desktop tool unavailable'), {code:'DESKTOP_TOOL_UNAVAILABLE',preflight:true});continue;}
       this.names.set(suffix, matches[0].name);
     }
     this.verifiedAt = Date.now();
     return this;
   }
-  healthy() { return !!this.child && !this.child.killed && this.child.exitCode === null && Date.now() - (this.verifiedAt || 0) < 20000; }
+  healthy(maxAge=20000) { return !!this.child && !this.child.killed && this.child.exitCode === null && Date.now() - (this.verifiedAt || 0) < maxAge; }
+  supports(name){return ALLOWED.has(name)&&this.names.has(name);}
   rpc(method, params, timeout = 10000) {
     if (!this.child || this.child.killed || this.child.exitCode !== null) return Promise.reject(Object.assign(new Error('Desktop client not running'), {code:'DESKTOP_UNAVAILABLE',preflight:true}));
     const id = ++this.next;
@@ -59,7 +61,7 @@ export class AppClient {
   }
   async call(name, args, turn = '') {
     if (!ALLOWED.has(name) || !this.names.has(name)) throw Object.assign(new Error('Tool is not allowed'), {code:'DESKTOP_TOOL_UNAVAILABLE',preflight:true});
-    const result = await this.rpc('tools/call', {name:this.names.get(name),arguments:args,_meta:{'x-codex-turn-metadata':{thread_id:this.session,...(turn ? {turn_id:turn} : {})}}},name === 'send_message_to_thread' ? 45000 : 15000);
+    const result = await this.rpc('tools/call', {name:this.names.get(name),arguments:args,_meta:{'x-codex-turn-metadata':{thread_id:this.session,...(turn ? {turn_id:turn} : {})}}},['send_message_to_thread','create_thread'].includes(name) ? 45000 : 15000);
     if (result.isError) throw Object.assign(new Error('Desktop tool rejected the request'), {code:'DESKTOP_TOOL_REJECTED'});
     this.verifiedAt = Date.now();
     return mcpData(result);

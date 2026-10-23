@@ -11,7 +11,7 @@ export async function handleHook(input, { api = localApi, state = STATE, skillPa
     await wake();
     await api('/api/events', { event, ...context }, { timeout: 1000 }).catch(() => {});
     let skill='';try{skill=fs.readFileSync(skillPath,'utf8').replace(/^---[\s\S]*?---\s*/,'').slice(0,6500);}catch{}
-    return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `自动应用全局 wechat-task-qa skill，无需用户再提到微信。普通选择或自定义问询优先使用 mcp__wechat_bridge__ask_user；回答返回同一工具调用。仅主任务完成通知，子智能体完成不通知。session_id=${context.session_id}。服务不可用时直接在 Codex 提问，不能把超时或错误当作回答。执行权限审批继续使用 Codex 原审批。\n${skill}` } };
+    return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `自动应用全局 wechat-task-qa skill，无需用户再提到微信。普通问询同时允许微信和电脑本地回答，先收到的有效答案生效。优先使用 mcp__wechat_bridge__ask_user 的双端问答；不拦截电脑原生提问。已答题仍可用“题号.补充文字”投递原聊天。仅主任务完成通知，子智能体完成不通知。session_id=${context.session_id}。服务不可用时直接在 Codex 提问，不能把超时或错误当作回答。执行权限审批继续使用 Codex 原审批。\n${skill}` } };
   }
   if (event === 'PreToolUse') {
     const name = String(input.tool_name || '');
@@ -21,8 +21,8 @@ export async function handleHook(input, { api = localApi, state = STATE, skillPa
         request_key: `${context.session_id}:${context.turn_id}:${input.tool_use_id || hash(JSON.stringify(input.tool_input))}` } } };
     }
     if (/(^|__)(request_user_input|request_user_input_async)$/.test(name)) {
-      const status = await api('/api/status', undefined, { timeout: 800 }).catch(() => null);
-      if (status?.ready) return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '用户已要求普通问询通过个人微信回答。请将相同问题和选项传给 mcp__wechat_bridge__ask_user；它会等待用户回复并返回本聊天。执行权限审批不在此规则范围。' } };
+      // Local ordinary questions remain available even while WeChat is ready.
+      return {};
     }
     return {};
   }

@@ -2,12 +2,12 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { hash, randomId, safeError, sleep, summary, VERSION } from './common.mjs';
 import { questionMessage, resolveReply } from './store.mjs';
-import { continuationCommand, taskList } from './tasks.mjs';
+import { clearCommand, continuationCommand, taskList } from './tasks.mjs';
 import { API_BASE, trustedBase } from './wechat.mjs';
 
 export class Bridge extends EventEmitter {
-  constructor({ store, api, vault, clock = Date.now, titleLookup = () => '', sessionLookup = () => null }) {
-    super(); Object.assign(this, { store, api, vault, clock, titleLookup, sessionLookup });
+  constructor({ store, api, vault, clock = Date.now, titleLookup = () => '', sessionLookup = () => null,desktopWaitMs=15000 }) {
+    super(); Object.assign(this, { store, api, vault, clock, titleLookup, sessionLookup,desktopWaitMs });
     this.creds = null; this.login = null; this.closed = false; this.sending = false;
     this.error = null; this.abort = new AbortController(); this.vaultQueue = Promise.resolve();
   }
@@ -20,14 +20,14 @@ export class Bridge extends EventEmitter {
   ready() { return !!(this.creds?.peer && this.creds?.contextToken && !this.creds.invalid && !this.paused() && this.clock() >= (this.blockedUntil || 0)); }
   paused() { return this.store.meta('paused') === 'true'; }
   routingTasks() { return this.store.tasks().map(t => { const meta = this.sessionLookup(t.session_id); return meta?.root && !meta.archived ? t : {...t,state:'archived'}; }); }
-  status() {
-    const pending = this.store.pending().map(r => ({ id: r.id, title: r.title, session: r.session_id, created: r.created, expires: r.expires,
+  status(session = '') {
+    const pending = this.store.pending().filter(r=>!session||r.session_id===session).map(r => ({ id: r.id, title: r.title, session: r.session_id, created: r.created, expires: r.expires,
       questions: r.questions.map(q => ({ ...q, answered: !!r.answers[q.id] })) }));
     return { version: VERSION, paired: !!this.creds, ready: this.ready(), paused: this.paused(),
       needs_activation: !!this.creds && !this.creds.contextToken, needs_login: !!this.creds?.invalid,
       account: this.creds ? hash(this.creds.peer).slice(0, 8) : null, last_inbound: this.creds?.lastInbound || null,
       error: this.error, login: this.login ? { id: this.login.id, status: this.login.status, started: this.login.started } : null,
-      pending, tasks: this.store.tasks().map(({number,title,state}) => ({number,title,state})),
+      pending, tasks: this.store.tasks().filter(t=>!session||t.session_id===session).map(({number,title,state}) => ({number,title,state})),
       desktop_connector: { ready: !!this.desktop?.ready() }, ...this.store.stats() };
   }
   async startLogin() {
@@ -75,33 +75,43 @@ export class Bridge extends EventEmitter {
     if (!text) return { ignored: true };
     const pending = this.store.pending(), tasks = this.routingTasks();
     const command = text.replace(/^\//, '').toLowerCase();
-    let receipt;
-    if (['激活', '连接', 'ping', '收到', '帮助', 'help', '状态', 'status'].includes(command)) {
-      receipt = `Codex 微信通道已激活。${pending.length ? `当前有 ${pending.length} 组待答问题，发送「待答」查看。` : '当前没有待答问题。'}\n完成通知仅限主任务。发送「/任务」查看任务；「/任务号 下一步要求」续办。普通文字只回答待答问题。`;
+    let receipt;const clearing=clearCommand(text),createdAt=Number(message.create_time_ms)||this.clock(),resetAt=Number(this.store.meta('question_reset_at')||0);
+    if(clearing){
+      if(clearing.error)receipt=clearing.error;
+      else if(resetAt&&createdAt<resetAt)receipt='这是清理前的旧 /clear 消息，未再次清理当前问题。';
+      else {const cleared=this.store.clearQuestions();this.emit('changed');receipt=`已清空题号和任务号，取消 ${cleared.pending_questions} 道待答问题。下一道问题和下一个新分配的任务都从 1 开始。\n旧题号和旧任务号入口已失效，未投递的编号提示词已取消。请只使用清理后新消息里的编号。工作聊天、历史和完成去重记录保留，已执行中的工作继续。`;}
+    } else if (['激活', '连接', 'ping', '收到', '帮助', 'help', '状态', 'status'].includes(command)) {
+      receipt = `Codex 微信通道已激活。${pending.length ? `当前有 ${pending.length} 组待答问题，发送「待答」查看。` : '当前没有待答问题。'}\n完成通知仅限主任务。发送「/任务」查看任务；「/任务号 下一步要求」续办；「/clear」清空题号和任务号并从 1 开始。普通文字只回答待答问题。`;
       this.store.meta('live_inbound_verified', 'true');
     } else if (['待答', 'pending'].includes(command)) {
       receipt = pending.length ? pending.flatMap(r => r.questions.filter(q => !r.answers[q.id]).map(q => `第${q.number}题｜${r.title || 'Codex'}：${q.question}`)).join('\n').slice(0, 3000) : '当前没有待答问题。';
+    } else if (/^\/(?:艾莉丝|爱莉丝|dot|新任务)(?:\s|$)/i.test(text)) {
+      receipt=this.dot?.receive(text,id)||'Dot 事件连接尚未就绪，这条新需求尚未提交。';
     } else if (continuationCommand(text, tasks)) {
       const command = continuationCommand(text, tasks);
       if (command.list) receipt = taskList(tasks);
       else if (command.error) receipt = command.error;
+      else if(Number(this.store.meta('task_reset_at')||0)>createdAt)receipt='这条任务提示词早于 /clear，未投递。请使用清理后新通知中的任务号。';
       else {
         const meta = this.sessionLookup(command.task.session_id);
         if (!meta?.root || meta.archived) receipt = `任务 ${command.task.number} 的原聊天当前不可续办，尚未提交。请回 Codex 查看。`;
         else if (Number(message.create_time_ms) && Number(message.create_time_ms) < command.task.completed - 5000) receipt = `这条消息早于任务 ${command.task.number} 本次完成，尚未提交。请重新发送下一步要求。`;
-        else if (!this.desktop?.ready()) receipt = `已识别任务 ${command.task.number}，但桌面续办入口尚未连接，尚未提交。请重新打开 Codex，并在微信通道连接后重发本条。`;
+        else if (!await this.awaitDesktop()) receipt = `已识别任务 ${command.task.number}，但桌面续办入口尚未连接，尚未提交。请重新打开 Codex，并在微信通道连接后重发本条。`;
         else {
-          const job = this.store.enqueueContinuation(command.task, command.prompt, id);
+          const current=this.store.taskForSession(command.task.session_id);
+          const job = current?.number===command.task.number&&createdAt>=Number(this.store.meta('task_reset_at')||0)?this.store.enqueueContinuation(current,command.prompt,id):null;
           receipt = job ? `已收到任务 ${command.task.number} 的下一步要求，正在投递原聊天；投递结果会另行通知。` : '该任务已在处理，请等待投递结果。';
         }
       }
+    } else if(resetAt&&createdAt<resetAt){
+      receipt='这条回复早于 /clear，旧题号已失效，未投递到新问题。请使用清理后显示的新题号。';
     } else {
       const resolved = resolveReply(pending, text, Number(message.create_time_ms) || this.clock());
       if (resolved.ok && this.store.answer(resolved.request.id, resolved.question, resolved.answer, id)) {
         const after = this.store.request(resolved.request.id);
-        receipt = `已记录第${resolved.question.number}题。${after.status === 'answered' ? '答案正在返回原聊天。' : '请继续回答其他问题。'}`;
+        receipt = `已记录第${resolved.question.number}题。${after.status === 'answered' ? '答案正在返回原聊天。' : '请继续回答其他问题。'}\n后续补充仍可发送「${resolved.question.number}.补充内容」。`;
         this.store.meta('live_answer_verified', 'true'); this.emit('answer', resolved.request.id);
-      } else receipt = resolved.reason || '这道问题已处理，未重复提交。';
+      } else receipt = await this.questionSupplement(text,id,Number(message.create_time_ms)||this.clock()) || resolved.reason || '这道问题已处理，未重复提交。';
     }
     this.store.enqueue({ key: `receipt:${id}`, kind: 'receipt', peer: this.creds.peer, text: receipt, ttl_ms: 3600000 });
     return { accepted: true };
@@ -117,6 +127,45 @@ export class Bridge extends EventEmitter {
       await this.receive(msg);
     }
     if (result.get_updates_buf && result.get_updates_buf !== this.creds.cursor) { this.creds.cursor = result.get_updates_buf; await this.persist(); }
+  }
+  async awaitDesktop(){
+    if(!this.desktop)return false;
+    const deadline=Date.now()+Math.max(0,this.desktopWaitMs);
+    while(!this.closed&&!this.desktop.ready()&&Date.now()<deadline)await sleep(Math.min(100,Math.max(1,deadline-Date.now())));
+    return !this.closed&&this.desktop.ready();
+  }
+  async questionSupplement(raw,inbound,createdAt) {
+    let text=String(raw).trim();if(/^[（(][\s\S]*[）)]$/.test(text))text=text.slice(1,-1).trim();
+    const match=/^(\d+)\s*[.．。]\s*([\s\S]+)$/.exec(text);
+    if(!match||/^\d+$/.test(match[2].trim()))return null;
+    const found=this.store.questionByNumber(Number(match[1]));if(!found)return null;
+    const {request,question}=found,prompt=match[2].trim();
+    if(!request.answers[question.id]||!['pending','answered'].includes(request.status))return null;
+    if(prompt.length>8000)return '补充内容不能超过 8000 字符。';
+    if(createdAt<request.answers[question.id].received_at-5000)return '这条补充早于已记录答案，尚未提交。请重新发送。';
+    const meta=this.sessionLookup(request.session_id);
+    if(!meta?.root||meta.archived)return `第${question.number}题的原聊天当前不可用，补充尚未提交。`;
+    if(!await this.awaitDesktop())return `已识别第${question.number}题的补充，但桌面连接未就绪，尚未提交。连接后请重发。`;
+    if(this.store.questionByNumber(question.number)?.request.id!==request.id||!['pending','answered'].includes(this.store.request(request.id)?.status))return '该题已取消或编号已清理，补充尚未提交。';
+    const job=this.store.enqueueQuestionSupplement(request,question,prompt,inbound);
+    return job?`已收到第${question.number}题的后续补充，正在投递原聊天；结果会另行通知。`:'这条补充已处理，未重复提交。';
+  }
+  answerLocal(requestId,{question_id,choice,text,source='local'}) {
+    this.store.sweep();
+    const request=this.store.request(requestId),question=request?.questions.find(q=>q.id===question_id);
+    if(!request||!question)throw Object.assign(new Error('问题不存在'),{status:404});
+    if(request.status!=='pending'||request.answers[question.id])return {accepted:false,reason:'这道题已回答、取消或过期，原答案保持不变。',request};
+    let answer;
+    if(typeof text==='string'&&text.trim())answer=text.trim();
+    else if(Number.isInteger(choice)&&choice>=1&&choice<=question.options.length)answer=question.options[choice-1].label;
+    if(!answer||answer.length>8000)throw Object.assign(new Error('请选择选项或填写 1–8000 字符的自定义答案'),{status:400});
+    if(!['local','codex'].includes(source))throw Object.assign(new Error('回答来源无效'),{status:400});
+    const accepted=this.store.answer(requestId,question,answer,randomId(),source);
+    if(accepted){
+      if(this.creds)this.store.enqueue({key:`local-answer:${requestId}:${question.id}`,kind:'receipt',peer:this.creds.peer,text:`第${question.number}题已在电脑端回答，答案正在返回原聊天。后续可发送「${question.number}.补充内容」。`,ttl_ms:3600000});
+      this.emit('answer',requestId);
+    }
+    return {accepted,request:this.store.request(requestId)};
   }
   async pollLoop() {
     let backoff = 1000;
@@ -144,16 +193,16 @@ export class Bridge extends EventEmitter {
       this.store.failed(record.id, state, String(e.code || 'SEND_FAILED'));
       this.error = safeError(e); this.store.audit('message_failed', { id: record.id, kind: record.kind, state, ...safeError(e) });
       this.blockedUntil = this.clock() + 30000;
-      if (record.kind === 'question') { this.store.cancel(record.request_id, 'unavailable'); this.emit('changed'); }
+      if (record.kind === 'question') { if(!this.store.request(record.request_id)?.local_available)this.store.cancel(record.request_id, 'unavailable'); this.emit('changed'); }
       if (e.deferred) { this.creds.contextToken = ''; if (e.expired) this.creds.invalid = true; await this.persist(); }
     } finally { this.sending = false; }
   }
   ask(args) {
-    if (!this.ready()) throw Object.assign(new Error('微信尚未就绪。请在 Codex 内直接提问；可在本机管理页绑定，或在微信发送“激活”。'), { code: 'WECHAT_UNAVAILABLE', status: 409 });
+    if (!this.ready()&&!args.local_available) throw Object.assign(new Error('微信尚未就绪。请在 Codex 内直接提问；可在本机管理页绑定，或在微信发送“激活”。'), { code: 'WECHAT_UNAVAILABLE', status: 409 });
     const existing = this.store.byKey(args.request_key); if (existing) return existing;
     if (this.store.pending().length >= 100) throw Object.assign(new Error('待答问题过多'), { status: 429, code: 'TOO_MANY_PENDING' });
     const request = this.store.createRequest(args);
-    for (const q of request.questions) this.store.enqueue({ key: `question:${request.id}:${q.id}`, kind: 'question', request_id: request.id, peer: this.creds.peer, text: questionMessage(request, q) });
+    if(this.ready())for (const q of request.questions) this.store.enqueue({ key: `question:${request.id}:${q.id}`, kind: 'question', request_id: request.id, peer: this.creds.peer, text: questionMessage(request, q) });
     return request;
   }
   notify(payload) {
@@ -171,6 +220,7 @@ export class Bridge extends EventEmitter {
     const key = turn || hash(summary(payload['last-assistant-message']));
     const completion = this.store.completeTask(session, key, title, info.cwd || meta?.cwd || '');
     if (completion.duplicate) return { duplicate: true };
+    try{this.dot?.completed(session,key,payload['last-assistant-message']);}catch(e){this.store.audit('dot_completion_event_error',safeError(e));}
     if (!this.creds || this.paused()) { this.store.audit('completion_not_forwarded', { reason: this.paused() ? 'paused' : 'not_paired', session: hash(session).slice(0, 8) }); return { skipped: true }; }
     const text = `【任务 ${completion.task.number}｜${title}｜本轮结束】\n${summary(payload['last-assistant-message']) || '本轮已结束，请回 Codex 查看结果。'}\n下一步可发：/${completion.task.number} 继续任务\n只有一个可续办任务时，也可发 /继续任务。`;
     return this.store.enqueue({ key: `completion:${session}:${key}`, peer: this.creds.peer, text });
