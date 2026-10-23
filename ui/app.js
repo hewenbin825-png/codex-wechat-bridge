@@ -2,6 +2,15 @@ let token = location.hash.slice(1) || sessionStorage.getItem('bridgeToken') || '
 if (location.hash) history.replaceState(null, '', location.pathname);
 const el = id => document.getElementById(id);
 let qrSession = '', qrObject = '', working = false;
+const questionNodes=new Map();
+async function answerQuestion(r,q,body) {
+  working=true;
+  try {
+    const result=await (await api(`/api/requests/${r.id}/answer`,{question_id:q.id,...body,source:'local'})).json();
+    el('answerNotice').textContent=result.accepted?`第${q.number}题已在电脑端提交。后续可在微信发送「${q.number}.补充内容」。`:result.reason;
+  } catch(e) {el('answerNotice').textContent=e.message;}
+  finally {working=false;await refresh();}
+}
 const displayTime = n => n ? new Date(n).toLocaleString('zh-CN', { hour12: false }) : '尚无';
 async function api(route, body) {
   const response = await fetch(route, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -18,13 +27,25 @@ async function refresh() {
     el('lastIn').textContent = displayTime(state.last_inbound); el('lastOut').textContent = displayTime(state.last_sent);
     el('pause').textContent = state.paused ? '恢复通知' : '暂停通知'; el('pause').dataset.paused = String(state.paused);
     el('test').disabled = !state.ready;
-    el('pending').replaceChildren();
+    const liveQuestions=new Set();
     for (const r of state.pending) for (const q of r.questions.filter(q => !q.answered)) {
+      const key=`${r.id}:${q.id}`;liveQuestions.add(key);
+      if(questionNodes.has(key))continue;
       const node = document.createElement('div'); node.className = 'question';
-      node.textContent = `第${q.number}题｜${r.title || 'Codex'}\n${q.question}\n${q.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n')}\n到期：${displayTime(r.expires)}`;
+      const title=document.createElement('p');title.textContent=`第${q.number}题｜${r.title||'Codex'}\n${q.question}`;node.append(title);
+      for(const [index,option] of q.options.entries()) {
+        const button=document.createElement('button');button.type='button';button.textContent=`${index+1}. ${option.label}`;button.title=option.description||'';
+        button.onclick=()=>answerQuestion(r,q,{choice:index+1});node.append(button);
+      }
+      const form=document.createElement('form'),text=document.createElement('textarea'),submit=document.createElement('button');
+      text.maxLength=8000;text.rows=3;text.placeholder='也可以直接填写自己的答案';text.setAttribute('aria-label',`第${q.number}题自定义回答`);
+      submit.type='submit';submit.className='primary';submit.textContent='提交文字回答';form.append(text,submit);form.onsubmit=event=>{event.preventDefault();answerQuestion(r,q,{text:text.value});};node.append(form);
+      const expires=document.createElement('small');expires.textContent=`到期：${displayTime(r.expires)}`;node.append(expires);
       el('pending').append(node);
+      questionNodes.set(key,node);
     }
-    if (!el('pending').childNodes.length) el('pending').textContent = '当前没有待答问题。';
+    for(const [key,node] of questionNodes)if(!liveQuestions.has(key)){node.remove();questionNodes.delete(key);}
+    el('emptyPending').hidden=liveQuestions.size>0;
     el('stats').textContent = state.outbox.map(x => `${x.state}: ${x.count}`).join('   ');
     el('error').textContent = state.error ? `最近连接状态：${state.error.code}。未把发送失败算作成功。` : '';
     const login = state.login;
