@@ -73,15 +73,18 @@ def desired_config(node, target):
         'env_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_APP_TOOLS_CALLER_HOST_ID"]',
         'enabled = true', 'required = false', '[mcp_servers.wechat_bridge.env]',
         f'CODEX_WECHAT_STATE = {q(target / "state")}',
+        'CODEX_WECHAT_LOCAL_UI = "native-mcp-v2"',
         '[mcp_servers.wechat_bridge.tools.ask_user]', 'approval_mode = "approve"', END])
 
 def desired_instructions():
     return '\n'.join([START, '# 个人微信普通问答与任务续办',
         '- 全局默认：每个主任务启动或恢复时自动应用 wechat-task-qa skill，无需用户再次提及微信。SessionStart 加载技能指引；微信 MCP 启动并维持本机服务，不能只依据 skill 文件存在就声称通道可用。',
-        '- 用户要求：只在本机 Codex 主任务完成回复时发送简短微信摘要；子智能体完成不发通知、不分配任务号。普通问题优先通过个人微信询问，用户可回复选项编号或自定义内容。',
-        '- 普通问询使用 mcp__wechat_bridge__ask_user，一次 1-3 道问题，给出稳定 id、question 和可选 options（label/description）。该工具等待的答案属于当前原聊天。',
+        '- 用户要求：只在本机 Codex 主任务完成回复时发送简短微信摘要；子智能体完成不发通知、不分配任务号。普通问题同时允许微信和电脑回答，用户可回复选项编号或自定义文字，先收到的有效答案生效，不拦截电脑原生提问。',
+        '- 普通问询使用 mcp__wechat_bridge__ask_user，每次调用只放一道题，给出稳定 id、question 和可选 options（label/description）。需要 1-3 题时独立调用，可并发等待。使用 GPT/Codex 原生问答界面，不用自绘弹窗；手机答后撤销对应原生卡，须实际验收关闭。管理页和原聊天真实用户答复也有效；旧 MCP 连接须重载新代码。',
+        '- 用户明确授权原生问题框代填后，微信真实答案到达时按 wechat-task-qa 的原生回填步骤处理选项和自定义文字；核对同一道普通问题，提交后立即结束 computer-use 控制。安装不自动赋予代填权限，执行审批不得代填。',
         '- 微信回复约定：只有一题时直接回复 1、2 或自由文字；多题使用 1.1、2.2 或 2.这样改，点号前为消息中显示的稳定题号，点号后为选项或自定义答案。题号由桥接分配，答完不重排；无需长 Q 编号或“自定义：”前缀。详见技能 wechat-task-qa。',
-        '- 任务续办与题号分开：完成通知显示固定任务号；微信 /1 下一步要求 回到任务 1 的原聊天。只有一个可续办主任务时，可用 /继续任务 或 /下一步提示词；多个主任务可续办而未带号时，必须让用户选择，不能默认最新任务。/任务 查看列表。普通文字仍只回答待答问题。',
+        '- 微信 /clear 同时清空题号和任务号（包括艾莉丝任务），取消待答及未投递的编号提示词；旧编号入口失效，下一个问题和新分配任务均从 1 开始。保留工作聊天、编号历史和完成去重记录，已执行中的工作继续。只使用清理后新消息的编号；此命令不作为任务提示词，取消不当作答案。',
+        '- 任务续办与题号分开：完成通知显示固定任务号；微信 /1 下一步要求 回到任务 1 的原聊天。只有一个可续办主任务时，可用 /继续任务 或 /下一步提示词；多个主任务可续办而未带号时，必须让用户选择，不能默认最新任务。/任务 查看列表。普通文字回答待答问题；已答题可用 5.补充内容 投递第 5 题原聊天，重复纯数字不当补充，不新建聊天或任务号。',
         '- 不得将微信问答工具用于命令、文件、网络权限或其他执行授权审批；这些仍走 Codex 正常审批。',
         '- 若工具未提供或返回 unavailable、error、expired、cancelled，直接在 Codex 内询问，不能将故障当作用户回答。必要答案未收到前，不执行依赖它的工作。',
         '- 不要额外调用发送工具重复发送完成通知；由本地 Stop 钩子和桌面连接补充检测按原聊天与轮次去重。/ 提示词只用于指定原主任务的下一步工作，不是执行权限许可；桥接未连通时不能声称已经开始续办。', END])
@@ -147,7 +150,7 @@ def install(args):
         if p.exists(): shutil.copy2(p, backup / p.name)
     for dirname in ['src', 'scripts', 'vendor', 'ui']:
         shutil.copytree(SOURCE / dirname, target / dirname, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    for filename in ['package.json', 'README.md', 'THIRD_PARTY_NOTICES.md']:
+    for filename in ['package.json', 'README.md', 'THIRD_PARTY_NOTICES.md', 'DOT_SETUP.md']:
         if (SOURCE / filename).exists(): shutil.copy2(SOURCE / filename, target / filename)
     (target / 'state').mkdir(exist_ok=True)
     (target / 'state' / 'integration-disabled').unlink(missing_ok=True)
@@ -158,7 +161,7 @@ def install(args):
         atomic(skill_target, skill_source.read_bytes())
     write_launcher(target, args.node)
     manifest = {'owner': NAME, 'version': json.loads((SOURCE / 'package.json').read_text('utf-8'))['version'], 'source': str(SOURCE), 'target': str(target), 'node': str(args.node),
-        'installed_at': int(time.time()), 'backup': str(backup), 'notify_preserved': True,
+        'python': sys.executable, 'installed_at': int(time.time()), 'backup': str(backup), 'notify_preserved': True,
         'previous_run_value': old_manifest.get('previous_run_value'), 'installed_run_value': old_manifest.get('installed_run_value')}
     atomic(target / 'installation.json', json.dumps(manifest, ensure_ascii=False, indent=2))
     if read_text(config_path) != original_config or read_text(agents_path) != original_agents or json.loads(read_text(hooks_path) or '{}') != original_hooks:
