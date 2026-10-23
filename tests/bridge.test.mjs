@@ -108,7 +108,7 @@ test('Tencent request construction, exact uint64 IDs and trusted redirects', asy
 
 test('hooks preserve native fallback, inject real context and never approve permissions', async () => {
   const native = { hook_event_name: 'PreToolUse', tool_name: 'request_user_input', session_id: 'actual', turn_id: 'T' };
-  assert.equal((await handleHook(native, { api: async () => ({ ready: true }) })).hookSpecificOutput.permissionDecision, 'deny');
+  assert.deepEqual(await handleHook(native, { api: async () => ({ ready: true }) }), {});
   assert.deepEqual(await handleHook(native, { api: async () => { throw new Error('offline'); } }), {});
   assert.deepEqual(await handleHook({ ...native, tool_name: 'request_permissions' }, { api: async () => ({ ready: true }) }), {});
   const changed = await handleHook({ ...native, tool_name: 'mcp__wechat_bridge__ask_user', tool_use_id: 'tool-7', tool_input: { session_id: 'forged', questions: [] } });

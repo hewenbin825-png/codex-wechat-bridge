@@ -17,7 +17,7 @@ function fixture(t, clock = Date.now) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(),'codex-wechat-tasks-'));
   const store = new Store(path.join(dir,'bridge.sqlite'),clock);
   const metadata = new Map([[A,{root:true,title:'文章发布',cwd:'test-A'}],[B,{root:true,title:'硬件诊断',cwd:'test-B'}],[CHILD,{root:false,title:'子智能体'}]]);
-  const bridge = new Bridge({store,clock,api:{send:async()=>{}},vault:{save:async()=>{}},sessionLookup:id=>metadata.get(id)});
+  const bridge = new Bridge({store,clock,api:{send:async()=>{}},vault:{save:async()=>{}},sessionLookup:id=>metadata.get(id),desktopWaitMs:0});
   bridge.creds = {peer:'owner',contextToken:'dummy-not-a-secret'};
   const hub = new DesktopHub(bridge,()=>[...metadata].filter(([,v])=>v.root).map(([id])=>({id})),clock);
   const worker = '44444444-4444-4444-8444-444444444444';
@@ -117,6 +117,50 @@ test('stale prompts cannot resume a newer completion and stale native health can
   assert.equal(f.hub.register({worker_id:f.worker,session_id:A,verified_at:at-21000}).active,false);
 });
 
+test('desktop verification renews before the previous lease expires, without dispatching any work',async t=>{
+  let at=Date.now();const f=fixture(t,()=>at),calls=[];
+  const client=new AppClient(A);client.child={killed:false,exitCode:null};client.verifiedAt=at-15000;
+  client.call=async(name)=>{calls.push(name);client.verifiedAt=at;return {threads:[]};};
+  const worker=new DesktopWorker({clock:()=>at,api:async(route,body)=>route.endsWith('/register')?f.hub.register(body):f.hub.poll(body)});
+  worker.id=f.worker;worker.session=A;worker.client=client;worker.monitor={scan:async()=>{}};worker.lastScan=at;
+  await worker.tick();at+=6000;
+  assert.equal(f.hub.ready(),true,'Early verification must leave more than six seconds of lease');
+  assert.deepEqual(calls,['list_threads']);
+});
+
+test('verified standby workers preserve readiness across the active worker exit or lease expiry and never double claim',async t=>{
+  let at=Date.now();const f=fixture(t,()=>at),standby='55555555-5555-4555-8555-555555555555';f.notify();
+  f.hub.register({worker_id:f.worker,session_id:A});at+=13000;
+  assert.equal(f.hub.register({worker_id:standby,session_id:B}).active,false);at+=8000;
+  assert.equal(f.hub.ready(),true);assert.equal(f.hub.worker.id,standby);
+  await f.bridge.receive(f.incoming('/1 继续原聊天'));const job=f.hub.poll({worker_id:standby}).job;assert.equal(job.session_id,A);
+  f.hub.register({worker_id:f.worker,session_id:A});f.hub.unregister({worker_id:standby});
+  assert.equal(f.hub.ready(),true);assert.equal(f.hub.worker.id,f.worker);assert.equal(f.hub.poll({worker_id:f.worker}).job,null);
+});
+
+test('a closed official desktop connection recovers with the same caller and never replays work',async t=>{
+  let at=Date.now(),starts=0,closed=0;const f=fixture(t,()=>at),calls=[],callers=[];
+  const worker=new DesktopWorker({clock:()=>at,api:async(route,body)=>route.endsWith('/register')?f.hub.register(body):f.hub.poll(body),clientFactory:session=>{
+    callers.push(session);const broken=++starts===1;
+    return {verifiedAt:at,start:async()=>{},healthy:()=>!broken,supports:()=>true,close:async()=>{closed++;},call:async name=>{calls.push(name);if(broken)throw new Error('desktop closed');return {threads:[]};}};
+  }});
+  t.after(()=>worker.close());worker.id=f.worker;worker.connect(A);await worker.starting;
+  assert.equal(worker.client,null);assert.equal(closed,1);
+  await worker.tick();assert.equal(starts,1,'Retry delay prevents a reconnect loop');
+  at+=30001;await worker.tick();await worker.starting;
+  assert.equal(f.hub.ready(),true);assert.deepEqual(callers,[A,A]);
+  assert.ok(calls.every(name=>name==='list_threads'),'Health recovery must not create or resend work');
+});
+
+test('an initial desktop startup failure retains automatic recovery while the owner is idle',async t=>{
+  let at=Date.now(),starts=0;const f=fixture(t,()=>at);
+  const worker=new DesktopWorker({clock:()=>at,api:async(route,body)=>route.endsWith('/register')?f.hub.register(body):f.hub.poll(body),clientFactory:()=>({verifiedAt:at,start:async()=>{if(++starts===1)throw new Error('desktop not ready');},close:async()=>{},healthy:()=>true,supports:()=>true,call:async()=>({threads:[]})})});
+  t.after(()=>worker.close());worker.id=f.worker;worker.connect(A);await worker.starting;
+  assert.ok(worker.timer,'Recovery polling must exist even when the initial connection failed');
+  assert.equal(worker.client,null);at+=30001;await worker.tick();await worker.starting;
+  assert.equal(starts,2);assert.equal(f.hub.ready(),true);
+});
+
 test('dispatch timeout or crash is uncertain and never automatically replayed; queued jobs expire', async t => {
   let at=1000000; const f=fixture(t,()=>at); f.notify();
   f.hub.register({worker_id:f.worker,session_id:A}); await f.bridge.receive(f.incoming('/1 下一步'));
@@ -161,7 +205,7 @@ test('App Tools adapter speaks stdio MCP, passes its actual caller, and blocks a
   fs.writeFileSync(server,`import readline from 'node:readline';
     readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;
     const result=m.method==='initialize'?{protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}:
-    m.method==='tools/list'?{tools:['list_threads','read_thread','send_message_to_thread'].map(name=>({name,inputSchema:{type:'object'}}))}:
+    m.method==='tools/list'?{tools:['list_threads','read_thread','send_message_to_thread','create_thread'].map(name=>({name,inputSchema:{type:'object'}}))}:
     {content:[{type:'text',text:JSON.stringify(m.params)}]};
     process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`);
   const client=new AppClient(A,{server,env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:'FIXTURE-NO-REAL-PIPE'}});
@@ -169,5 +213,9 @@ test('App Tools adapter speaks stdio MCP, passes its actual caller, and blocks a
   const result=await client.call('read_thread',{threadId:B},'real-test-turn');
   assert.equal(result._meta['x-codex-turn-metadata'].thread_id,A);
   assert.equal(result.arguments.threadId,B);
+  assert.equal(client.supports('create_thread'),true);
+  const created=await client.call('create_thread',{target:{type:'projectless'},prompt:'only owner request'});
+  assert.equal(created._meta['x-codex-turn-metadata'].thread_id,A);
+  assert.deepEqual(created.arguments,{target:{type:'projectless'},prompt:'only owner request'});
   await assert.rejects(client.call('exec_command',{cmd:'anything'}));
 });
