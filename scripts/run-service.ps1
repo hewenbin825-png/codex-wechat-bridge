@@ -17,7 +17,8 @@ if (Test-TaskBridgeReady) { exit 0 }
 # The task is a launcher. Return success after the independent service is ready;
 # do not leave a console PowerShell waiting for the lifetime of the Node process.
 $taskProcess = Start-Process -FilePath $taskManifest.node -ArgumentList @('"' + (Join-Path $taskRoot 'src\service.mjs') + '"') -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskState 'service.stdout.log') -RedirectStandardError (Join-Path $taskState 'service.stderr.log') -PassThru
-for ($taskAttempt=0;$taskAttempt -lt 24;$taskAttempt++) {
+# Cold logon can spend more than six seconds starting Node and opening the store.
+for ($taskAttempt=0;$taskAttempt -lt 120;$taskAttempt++) {
   Start-Sleep -Milliseconds 250
   if (Test-TaskBridgeReady) { exit 0 }
   if ($taskProcess.HasExited) { throw 'The bridge service exited before becoming ready.' }

@@ -73,22 +73,22 @@ def desired_config(node, target):
         'env_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_APP_TOOLS_CALLER_HOST_ID"]',
         'enabled = true', 'required = false', '[mcp_servers.wechat_bridge.env]',
         f'CODEX_WECHAT_STATE = {q(target / "state")}',
-        'CODEX_WECHAT_LOCAL_UI = "native-mcp-v2"',
+        'CODEX_WECHAT_LOCAL_UI = "chat-opt-in-v3"',
         '[mcp_servers.wechat_bridge.tools.ask_user]', 'approval_mode = "approve"', END])
 
 def desired_instructions():
-    return '\n'.join([START, '# 个人微信普通问答与任务续办',
-        '- 全局默认：每个主任务启动或恢复时自动应用 wechat-task-qa skill，无需用户再次提及微信。SessionStart 加载技能指引；微信 MCP 启动并维持本机服务，不能只依据 skill 文件存在就声称通道可用。',
-        '- 用户要求：只在本机 Codex 主任务完成回复时发送简短微信摘要；子智能体完成不发通知、不分配任务号。普通问题同时允许微信和电脑回答，用户可回复选项编号或自定义文字，先收到的有效答案生效，不拦截电脑原生提问。',
-        '- 普通问询使用 mcp__wechat_bridge__ask_user，每次调用只放一道题，给出稳定 id、question 和可选 options（label/description）。需要 1-3 题时独立调用，可并发等待。使用 GPT/Codex 原生问答界面，不用自绘弹窗；手机答后撤销对应原生卡，须实际验收关闭。管理页和原聊天真实用户答复也有效；旧 MCP 连接须重载新代码。',
-        '- 用户明确授权原生问题框代填后，微信真实答案到达时按 wechat-task-qa 的原生回填步骤处理选项和自定义文字；核对同一道普通问题，提交后立即结束 computer-use 控制。安装不自动赋予代填权限，执行审批不得代填。',
-        '- 微信回复约定：只有一题时直接回复 1、2 或自由文字；多题使用 1.1、2.2 或 2.这样改，点号前为消息中显示的稳定题号，点号后为选项或自定义答案。题号由桥接分配，答完不重排；无需长 Q 编号或“自定义：”前缀。详见技能 wechat-task-qa。',
-        '- 微信 /clear 同时清空题号和任务号（包括艾莉丝任务），取消待答及未投递的编号提示词；旧编号入口失效，下一个问题和新分配任务均从 1 开始。保留工作聊天、编号历史和完成去重记录，已执行中的工作继续。只使用清理后新消息的编号；此命令不作为任务提示词，取消不当作答案。',
-        '- 任务续办与题号分开：完成通知显示固定任务号；微信 /1 下一步要求 回到任务 1 的原聊天。只有一个可续办主任务时，可用 /继续任务 或 /下一步提示词；多个主任务可续办而未带号时，必须让用户选择，不能默认最新任务。/任务 查看列表。普通文字回答待答问题；已答题可用 5.补充内容 投递第 5 题原聊天，重复纯数字不当补充，不新建聊天或任务号。',
-        '- 艾莉丝默认对话：微信 /艾莉丝 对话 进入连续聊天，/艾莉丝 文字 直接交谈；无待答题时的普通文字可续聊，待答题、题号补充和任务号指令优先按原路由处理。/艾莉丝 退出对话 结束连续聊天。只有 /艾莉丝 创建任务 具体要求 或 /新任务 具体要求 才新建独立工作；/艾莉丝 继续任务 任务号 下一步要求 只续办指定已登记聊天。intent=conversation 只直接回复，不调用任何工作创建工具，不分配任务号。',
-        '- 不得将微信问答工具用于命令、文件、网络权限或其他执行授权审批；这些仍走 Codex 正常审批。',
-        '- 若工具未提供或返回 unavailable、error、expired、cancelled，直接在 Codex 内询问，不能将故障当作用户回答。必要答案未收到前，不执行依赖它的工作。',
-        '- 不要额外调用发送工具重复发送完成通知；由本地 Stop 钩子和桌面连接补充检测按原聊天与轮次去重。/ 提示词只用于指定原主任务的下一步工作，不是执行权限许可；桥接未连通时不能声称已经开始续办。', END])
+    return '\n'.join([START,
+        '# 按聊天选择微信提醒或原生问题卡',
+        '- 默认 native：使用 Codex 原始问题选择卡，不发微信问询或完成通知。全局 skill、服务启动、其他聊天开启、分叉或 Dot 新建工作均不自动启用。',
+        '- 用户在本聊天明确要求微信通知时，应用 wechat-task-qa，用 set_chat_mode(mode=wechat) 只开启当前聊天；要求关闭或恢复原始卡时设 native。按聊天 ID 保存并跨重启保持，其他聊天不受影响。',
+        '- 微信模式：ask_user 每次一题、立即返回 pending；在当前对话醒目显示 local_question_markdown，不调用原生问题卡或 computer-use 回填。问题提醒和完成摘要通过艾莉丝已连接的微信桥接直接发送，不等待 Dot 推理；真正与艾莉丝聊天仍走 Dot。',
+        '- 微信真实答案投递同一原聊天；电脑提示词中的真实答案用 answer_from_chat 记录。先收到的有效答案生效，不能代答。待答不是完成，取消和错误不是答案。手机单题可回 1/2/自由文字，多题用 题号.答案，已答题可用 题号.补充。',
+        '- /clear 清空题号和任务号（包括艾莉丝），取消待答与未投递编号提示词，下一个问题及新任务从 1 开始；保留聊天、模式设置、历史、去重和已执行工作。',
+        '- /任务 查看任务，/任务号 下一步要求 续办原聊天；只有一个可续办任务可省略号，多个不能默认最新。题号补充不新建任务。',
+        '- /艾莉丝 对话 和 /艾莉丝 文字 默认直接交谈；普通文字仅在无待答时续聊。只有 /艾莉丝 创建任务 或 /新任务 才创建独立工作；/艾莉丝 继续任务 任务号 要求 只续办指定聊天。conversation 不调用工作创建工具。',
+        '- 只有开启微信的本机主聊天完成时，由 Stop 与桌面检测去重通知；子智能体静默，不额外重复发送。微信故障时该聊天仍在电脑用醒目文字提问；默认 native 聊天照常用原始卡。',
+        '- 执行权限审批、登录与安全设置始终走 Codex 原审批；微信模式和普通答案不是执行授权。旧 MCP 需重载新工具，不能调用旧版卡片流程。',
+        END])
 
 def write_launcher(target, node):
     launcher = f'''$ErrorActionPreference = 'Stop'
@@ -101,7 +101,7 @@ try {{
   $null = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $taskCfg.port + "/api/status") -Headers @{{Authorization=("Bearer " + $taskToken)}} -TimeoutSec 2
   return
 }} catch {{}}
-& (Join-Path $taskRoot 'scripts\\service-task.ps1') -Action Start
+& (Join-Path $taskRoot 'scripts\\run-service.ps1')
 '''
     atomic(target / 'start.ps1', launcher)
     # The fragment never becomes an HTTP request or a server log entry.
@@ -162,7 +162,7 @@ def install(args):
         atomic(skill_target, skill_source.read_bytes())
     write_launcher(target, args.node)
     manifest = {'owner': NAME, 'version': json.loads((SOURCE / 'package.json').read_text('utf-8'))['version'], 'source': str(SOURCE), 'target': str(target), 'node': str(args.node),
-        'python': sys.executable, 'installed_at': int(time.time()), 'backup': str(backup), 'notify_preserved': True,
+        'python': sys.executable, 'installed_at': int(time.time()), 'backup': str(backup), 'notify_preserved': True, 'startup': 'codex_mcp_only',
         'previous_run_value': old_manifest.get('previous_run_value'), 'installed_run_value': old_manifest.get('installed_run_value')}
     atomic(target / 'installation.json', json.dumps(manifest, ensure_ascii=False, indent=2))
     if read_text(config_path) != original_config or read_text(agents_path) != original_agents or json.loads(read_text(hooks_path) or '{}') != original_hooks:
@@ -170,18 +170,16 @@ def install(args):
     atomic(config_path, updated_config)
     atomic(agents_path, block_replace(original_agents, desired_instructions()))
     atomic(hooks_path, json.dumps(updated_hooks, ensure_ascii=False, indent=2) + '\n')
-    if args.autostart:
+    if os.name == 'nt' and manifest.get('installed_run_value'):
         import winreg
-        shell = str(Path(os.environ['SystemRoot']) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
-        run_value = f'"{shell}" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{target / "start.ps1"}"'
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
             try: previous_run, _ = winreg.QueryValueEx(key, 'CodexWeChatBridge')
             except FileNotFoundError: previous_run = None
-            if not manifest['installed_run_value']: manifest['previous_run_value'] = previous_run
-            winreg.SetValueEx(key, 'CodexWeChatBridge', 0, winreg.REG_SZ, run_value)
-            manifest['installed_run_value'] = run_value
+            if previous_run == manifest['installed_run_value']: winreg.DeleteValue(key, 'CodexWeChatBridge')
+            elif previous_run is not None: raise RuntimeError('Startup value was modified by another owner; review before removing it')
+        manifest['installed_run_value'] = None
         atomic(target / 'installation.json', json.dumps(manifest, ensure_ascii=False, indent=2))
-    print(json.dumps({'installed': str(target), 'notify_preserved': True, 'hook_review': 'check Codex hooks/list or /hooks', 'autostart': args.autostart}, ensure_ascii=False))
+    print(json.dumps({'installed': str(target), 'notify_preserved': True, 'hook_review': 'check Codex hooks/list or /hooks', 'autostart': False, 'startup':'codex_mcp_only'}, ensure_ascii=False))
 
 def uninstall(args):
     home = Path(args.codex_home).resolve(); target = home / NAME
@@ -208,6 +206,7 @@ def main():
     parser.add_argument('--codex-home', required=True); parser.add_argument('--node'); parser.add_argument('--autostart', action='store_true')
     args = parser.parse_args()
     if args.action == 'install':
+        if args.autostart: parser.error('Windows startup is no longer used; start Codex to connect in the background')
         if not args.node or not Path(args.node).is_file(): parser.error('--node must point to an installed Node executable')
         install(args)
     else: uninstall(args)

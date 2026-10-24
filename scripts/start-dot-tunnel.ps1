@@ -1,5 +1,6 @@
-param([string]$TunnelId,[switch]$StoreRuntimeKey,[switch]$StoreRuntimeKeyFromStdin,[switch]$RegisterLogon,[switch]$Watch)
+param([string]$TunnelId,[switch]$StoreRuntimeKey,[switch]$StoreRuntimeKeyFromStdin,[switch]$RegisterLogon,[switch]$Watch,[int]$ParentProcessId=0)
 $ErrorActionPreference='Stop'
+if($RegisterLogon){throw 'Logon startup is no longer used. Start Codex to connect the existing tunnel in the background.'}
 $taskRoot=Split-Path -Parent $PSScriptRoot
 $taskState=Join-Path $taskRoot 'state\dot'
 $taskClient=Join-Path $taskRoot 'tools\tunnel-client.exe'
@@ -65,18 +66,8 @@ function Write-TaskDotStatus($taskStatus){
   [ordered]@{alias=$taskConfig.alias;process_running=$taskStatus.process_running;healthy=$taskStatus.healthy;ready=$taskStatus.ready;runtime_state=$taskStatus.runtime_state;tunnel_id=$taskConfig.tunnel_id} | ConvertTo-Json -Compress
 }
 if(!$Watch){$taskConnected=Connect-TaskDotRuntime;Write-TaskDotStatus $taskConnected}
-if($RegisterLogon){
-  $taskIdentity=[Security.Principal.WindowsIdentity]::GetCurrent()
-  $taskName='CodexDotErisTunnel-'+$taskIdentity.User.Value
-  $taskAction=New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$PSCommandPath+'" -Watch') -WorkingDirectory $taskRoot
-  $taskTrigger=New-ScheduledTaskTrigger -AtLogOn -User $taskIdentity.Name
-  $taskPrincipal=New-ScheduledTaskPrincipal -UserId $taskIdentity.User.Value -LogonType Interactive -RunLevel Limited
-  $taskSettings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
-  Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description 'Reconnect the owner-only Dot Eris MCP tunnel after interactive logon; no Windows password stored.' -Force | Out-Null
-  Write-Host 'Current-user logon startup registered for the Dot tunnel.'
-}
 if($Watch){
-  # Keep the scheduled owner process alive, including after its launcher exits.
+  # Started hidden by the Codex bridge, never by Windows logon.
   # The official managed alias remains the only tunnel process owner.
   $taskMutex=[Threading.Mutex]::new($false,('Local\CodexDotTunnelWatch-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value))
   $taskOwnsMutex=$false
@@ -85,6 +76,7 @@ if($Watch){
     if(!$taskOwnsMutex){exit 0}
     $taskLastReady=$false
     for(;;){
+      if($ParentProcessId -gt 0 -and !(Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue)){break}
       try{
         $taskStatus=Get-TaskDotRuntime
         if(!$taskStatus.process_running -or !$taskStatus.healthy -or !$taskStatus.ready){$taskStatus=Connect-TaskDotRuntime}
