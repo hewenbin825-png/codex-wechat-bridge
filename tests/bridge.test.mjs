@@ -16,12 +16,13 @@ import { serve } from '../src/service.mjs';
 function fixture(t, clock = Date.now) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-wechat-test-'));
   const store = new Store(path.join(dir, 'test.sqlite'), clock);
+  for(const id of ['A','B'])store.setChatMode(id,'wechat');
   const api = { sent: [], async send(c, text, id) { this.sent.push({ peer: c.peer, text, id }); }, async startLogin() { return { qrcode: 'q', qrcode_img_content: 'https://weixin.qq.com/q/test' }; } };
   const vault = { value: null, async load() { return this.value; }, async save(value) { this.value = structuredClone(value); } };
   const bridge = new Bridge({ store, api, vault, clock, sessionLookup: id => ({id,root:true,title:id,archived:0}) });
   bridge.creds = { token: 'fake-token-not-a-real-credential', peer: 'owner@im.wechat', base: 'https://ilinkai.weixin.qq.com', contextToken: 'fake-context' };
   t.after(async () => { await bridge.close(); store.close(); });
-  const ask = (session = 'session-A', key = session, questions = [{ id: 'choice', question: '下一步？', options: [{ label: '继续' }, { label: '暂停' }] }]) => bridge.ask({ request_key: key, session_id: session, turn_id: 'turn-1', title: session, questions });
+  const ask = (session = 'session-A', key = session, questions = [{ id: 'choice', question: '下一步？', options: [{ label: '继续' }, { label: '暂停' }] }]) => (store.setChatMode(session,'wechat'),bridge.ask({presentation:'chat_text', request_key: key, session_id: session, turn_id: 'turn-1', title: session, questions }));
   const incoming = (text, id = '1', overrides = {}) => ({ from_user_id: 'owner@im.wechat', message_type: 1, message_id: id, context_token: 'fresh-context', create_time_ms: clock(), item_list: [{ type: 1, text_item: { text } }], ...overrides });
   return { dir, store, api, vault, bridge, ask, incoming };
 }
@@ -46,7 +47,7 @@ test('unbound senders, stale messages, invalid options, cancellation and expirat
   assert.equal(f.store.request(r.id).status, 'pending');
   f.store.cancel(r.id); await f.bridge.receive(f.incoming(`${r.questions[0].code} 1`, 'late'));
   assert.equal(f.store.request(r.id).status, 'cancelled');
-  const second = f.ask('other'); at += 91000; f.store.sweep();
+  const second = f.ask('other'); at += 86400001; f.store.sweep();
   assert.equal(f.store.request(second.id).status, 'expired');
   assert.equal(resolveReply(f.store.pending(), '1', at).ok, false);
 });
@@ -71,19 +72,50 @@ test('completion deduplication, pending suppression and redacted summaries', asy
   assert.equal(summary('```password=abc```\n完成'), '[代码略] 完成');
 });
 
-test('uncertain sends are never automatically resent; platform rejection waits for activation', async t => {
-  const f = fixture(t);
+test('uncertain sends are never automatically resent; rate limits retain context and retry with a bound', async t => {
+  let at=1000000;const f = fixture(t,()=>at);
   f.api.send = async () => { throw Object.assign(new Error('timeout'), { uncertain: true, code: 'NETWORK_TIMEOUT' }); };
-  const n = f.store.enqueue({ key: 'uncertain', peer: f.bridge.creds.peer, text: '通知' });
+  const n = f.store.enqueue({kind:'receipt', key: 'uncertain', peer: f.bridge.creds.peer, text: '通知' });
   await f.bridge.drainOnce(); await f.bridge.drainOnce();
   assert.equal(f.store.db.prepare('SELECT state,attempts FROM outbox WHERE id=?').get(n.id).state, 'uncertain');
   assert.equal(f.store.db.prepare('SELECT attempts FROM outbox WHERE id=?').get(n.id).attempts, 1);
   f.bridge.blockedUntil = 0;
   f.api.send = async () => { throw Object.assign(new Error('quota'), { deferred: true, code: 'HTTP_429' }); };
-  const d = f.store.enqueue({ key: 'quota', peer: f.bridge.creds.peer, text: '通知' }); await f.bridge.drainOnce();
+  const d = f.store.enqueue({kind:'receipt', key: 'quota', peer: f.bridge.creds.peer, text: '通知' }); await f.bridge.drainOnce();
   assert.equal(f.bridge.ready(), false); assert.equal(f.store.db.prepare('SELECT state FROM outbox WHERE id=?').get(d.id).state, 'deferred');
-  await f.bridge.receive(f.incoming('激活', 'reactivate'));
+  assert.equal(f.bridge.status().needs_activation,false);assert.equal(f.bridge.creds.contextToken,'fake-context');
+  for(let i=0;i<5;i++){at+=30001;await f.bridge.drainOnce();}
+  assert.equal(f.store.db.prepare('SELECT attempts FROM outbox WHERE id=?').get(d.id).attempts,3);
+  assert.equal(f.store.db.prepare('SELECT attempts FROM outbox WHERE id=?').get(n.id).attempts,1);
+  await f.bridge.receive(f.incoming('普通消息也能刷新上下文', 'reactivate'));
   assert.equal(f.bridge.ready(), true); assert.equal(f.store.db.prepare('SELECT state FROM outbox WHERE id=?').get(d.id).state, 'queued');
+});
+
+test('generic rejection does not require activation; explicit context rejection does',async t=>{
+  const f=fixture(t);
+  f.api.send=async()=>{throw Object.assign(new Error('rejected'),{deferred:true,code:'ILINK_-2'});};
+  f.store.enqueue({kind:'receipt',key:'generic',peer:f.bridge.creds.peer,text:'test'});await f.bridge.drainOnce();
+  assert.equal(f.bridge.status().needs_activation,false);
+  f.bridge.blockedUntil=0;
+  f.api.send=async()=>{throw Object.assign(new Error('context rejected'),{deferred:true,contextInvalid:true,code:'ILINK_-2'});};
+  f.store.enqueue({kind:'receipt',key:'context',peer:f.bridge.creds.peer,text:'test'});await f.bridge.drainOnce();
+  assert.equal(f.bridge.status().needs_activation,true);
+});
+
+test('an older send failure cannot erase a freshly received owner context',async t=>{
+  const f=fixture(t);
+  f.api.send=async()=>{await f.bridge.receive(f.incoming('状态','fresh-during-send'));throw Object.assign(new Error('old context'),{deferred:true,contextInvalid:true,code:'ILINK_-2'});};
+  f.store.enqueue({kind:'receipt',key:'old-context',peer:f.bridge.creds.peer,text:'test'});await f.bridge.drainOnce();
+  assert.equal(f.bridge.creds.contextToken,'fresh-context');assert.equal(f.bridge.status().needs_activation,false);
+});
+
+test('only explicit context errors and expired sessions invalidate credentials',async()=>{
+  for(const [body,expected] of [[{ret:-2,errmsg:'rate limit'},false],[{ret:-2,errmsg:'context_token is expired'},true]]){
+    const api=new WeChatApi({fetchImpl:async()=>new Response(JSON.stringify(body))});
+    await assert.rejects(api.send({token:'test',peer:'owner',contextToken:'context'},'test','id'),e=>e.contextInvalid===expected&&!e.expired);
+  }
+  const api=new WeChatApi({fetchImpl:async()=>new Response('{"ret":-14}')});
+  await assert.rejects(api.send({token:'test',peer:'owner',contextToken:'context'},'test','id'),e=>e.expired===true);
 });
 
 test('undeliverable questions return unavailable instead of waiting without delivery', async t => {
@@ -140,8 +172,9 @@ test('local HTTP rejects anonymous, cross-origin and rebound-host requests', asy
   assert.equal(reboundStatus, 403);
 });
 
-test('real MCP child waits, accepts a WeChat answer and returns to the same tool call', async t => {
+test('real MCP child creates a text question and reads the later real answer without keeping a native call open', async t => {
   const f = fixture(t); const app = await serve({ state: f.dir, port: 0, bridge: f.bridge, listen: false });
+  f.store.setChatMode('original-chat','wechat');
   const close = f.store.close.bind(f.store); let closed = false; f.store.close = () => { if (!closed) { closed = true; close(); } };
   t.after(async () => { await app.close(); });
   const child = spawn(process.execPath, [path.join(ROOT, 'src', 'mcp.mjs')], { env: { ...process.env, CODEX_WECHAT_STATE: f.dir, CODEX_THREAD_ID: 'original-chat' }, windowsHide: true, stdio: ['pipe','pipe','pipe'] });
@@ -154,10 +187,10 @@ test('real MCP child waits, accepts a WeChat answer and returns to the same tool
   const pendingResult = rpc(3, 'tools/call', { name: 'ask_user', arguments: { title: '实际工具往返', questions: [{ id: 'choice', question: '选一个', options: [{ label: '继续' }, { label: '暂停' }] }] } });
   let group;
   for (let i = 0; i < 50 && !group; i++) { group = f.store.pending()[0]; if (!group) await sleep(50); }
-  assert.equal(group.session_id, 'original-chat'); assert.equal(replies.has(3), false);
+  assert.equal(group.session_id, 'original-chat');const initial=await pendingResult;assert.equal(initial.result.structuredContent.status,'pending');
   await f.bridge.receive(f.incoming('自定义：只整理结果', 'mcp-answer'));
-  const reply = await pendingResult;
-  assert.equal(reply.id, 3); assert.equal(reply.result.structuredContent.status, 'answered');
+  const reply = await rpc(4,'tools/call',{name:'check_answer',arguments:{request_id:group.id}});
+  assert.equal(reply.id, 4); assert.equal(reply.result.structuredContent.status, 'answered');
   assert.deepEqual(reply.result.structuredContent.answers.choice.answers, ['只整理结果']);
 });
 

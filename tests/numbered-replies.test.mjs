@@ -13,7 +13,7 @@ function setup(t, questions) {
   const bridge = new Bridge({ store, api: {}, vault: { async save() {} } });
   bridge.creds = {peer:'owner',contextToken:'fake',token:'fake'};
   t.after(async () => { await bridge.close(); store.close(); });
-  const ask = (key, qs=questions) => bridge.ask({session_id:key,request_key:key,title:key,questions:qs});
+  const ask = (key, qs=questions) => (store.setChatMode(key,'wechat'),bridge.ask({presentation:'chat_text',session_id:key,request_key:key,title:key,questions:qs}));
   let id = 0;
   const reply = text => bridge.receive({from_user_id:'owner',message_type:1,message_id:String(++id),create_time_ms:Date.now(),context_token:'fake',item_list:[{type:1,text_item:{text}}]});
   return {store,bridge,ask,reply,file};

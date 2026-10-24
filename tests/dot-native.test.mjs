@@ -25,7 +25,8 @@ async function fixture(t){
   const request=async(text='只回复独立验收通过',action='create',target)=>{
     const messageId='native-fixture-'+(++seq);
     const prior=store.db.prepare('SELECT max(rowid) AS n FROM dot_requests').get().n||0;
-    await bridge.receive({message_id:messageId,from_user_id:'owner',message_type:1,create_time_ms:at,item_list:[{type:1,text_item:{text:'/dot '+text}}]});
+    const command=action==='continue'?`/艾莉丝 继续任务 ${store.taskForSession(target)?.number||99999} ${text}`:'/新任务 '+text;
+    await bridge.receive({message_id:messageId,from_user_id:'owner',message_type:1,create_time_ms:at,item_list:[{type:1,text_item:{text:command}}]});
     const row=store.db.prepare('SELECT id FROM dot_requests WHERE rowid>? ORDER BY rowid DESC LIMIT 1').get(prior);
     assert.ok(row,'The authenticated owner request must reach the dispatch inbox');
     dot.prepare({message_id:row.id,action,...(target?{session_id:target}:{})});return row.id;
@@ -62,8 +63,7 @@ test('official local create_thread receives only the authenticated owner prompt,
 test('native continuation returns to the prepared known Codex chat, without creating or rerouting another chat',async t=>{
   const f=await fixture(t);f.dot.configure({native_dispatch:true});f.register();
   const first=await f.request();f.dot.native.enqueue(first);f.fresh();await f.worker(async()=>({threadId:B})).dispatch(f.hub.poll({worker_id:W}).job);
-  await assert.rejects(()=>f.request('继续不属于调度表的聊天','continue',A),/previously bound/);
-  const second=await f.request('继续整理结果','continue',B);f.dot.native.enqueue(second);const calls=[];
+  const second=await f.request('继续整理结果','continue',B);assert.throws(()=>f.dot.prepare({message_id:second,action:'continue',session_id:A}),/explicit task action and target/);f.dot.native.enqueue(second);const calls=[];
   await f.worker(async(name,args)=>{calls.push({name,args});return {};}).dispatch(f.hub.poll({worker_id:W}).job);
   assert.deepEqual(calls,[{name:'send_message_to_thread',args:{threadId:B,hostId:'local',prompt:'继续整理结果'}}]);
   assert.equal(f.dot.native.result(second).task_number,1);assert.equal(f.store.tasks().length,1);

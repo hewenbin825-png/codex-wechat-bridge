@@ -16,6 +16,7 @@ const A = '11111111-1111-4111-8111-111111111111', B = '22222222-2222-4222-8222-2
 function fixture(t, clock = Date.now) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(),'codex-wechat-tasks-'));
   const store = new Store(path.join(dir,'bridge.sqlite'),clock);
+  for(const id of [A,B])store.setChatMode(id,'wechat');
   const metadata = new Map([[A,{root:true,title:'文章发布',cwd:'test-A'}],[B,{root:true,title:'硬件诊断',cwd:'test-B'}],[CHILD,{root:false,title:'子智能体'}]]);
   const bridge = new Bridge({store,clock,api:{send:async()=>{}},vault:{save:async()=>{}},sessionLookup:id=>metadata.get(id),desktopWaitMs:0});
   bridge.creds = {peer:'owner',contextToken:'dummy-not-a-secret'};
@@ -66,7 +67,7 @@ test('slash parser separates question answers, requires a task in concurrent com
 
 test('unavailable desktop never claims submission; slash messages cannot answer pending questions', async t => {
   const f=fixture(t); f.notify();
-  const request = f.bridge.ask({request_key:'pending',session_id:A,questions:[{id:'choice',question:'格式？',options:['Word','PDF']}]});
+  const request = f.bridge.ask({presentation:'chat_text',request_key:'pending',session_id:A,questions:[{id:'choice',question:'格式？',options:['Word','PDF']}]});
   await f.bridge.receive(f.incoming('/继续任务'));
   assert.ok(f.receipts().at(-1).includes('尚未提交'));
   assert.equal(f.store.request(request.id).status,'pending');

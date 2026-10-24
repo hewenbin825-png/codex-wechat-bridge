@@ -18,6 +18,7 @@ const secret='whsec_'+Buffer.alloc(32,7).toString('base64');
 function fixture(t,managed=true){
   let now=Date.now(),vaultData=null,seq=0;
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'codex-dot-')),store=new Store(path.join(dir,'bridge.sqlite'),()=>now);
+  for(const id of [A,B])store.setChatMode(id,'wechat');
   const metadata=new Map([[A,{root:true,title:'独立任务 A',created_at:Math.floor(now/1000),cwd:'test-A'}],[B,{root:true,title:'独立任务 B',created_at:Math.floor(now/1000),cwd:'test-B'}],[CHILD,{root:false,title:'子智能体'}]]);
   const bridge=new Bridge({store,clock:()=>now,api:{send:async()=>{}},vault:{save:async()=>{}},sessionLookup:id=>metadata.get(id)});
   bridge.creds={peer:'owner',contextToken:'not-a-secret'};
@@ -33,7 +34,7 @@ function fixture(t,managed=true){
 
 test('Dot is opt-in; unavailable/new commands do not fall into an unrelated continuation or capture question answers',async t=>{
   const f=fixture(t);
-  const pending=f.bridge.ask({session_id:A,request_key:'own',questions:[{id:'q',question:'怎么选',options:[{label:'一'},{label:'二'}]}]});
+  const pending=f.bridge.ask({presentation:'chat_text',session_id:A,request_key:'own',questions:[{id:'q',question:'怎么选',options:[{label:'一'},{label:'二'}]}]});
   await f.bridge.receive(f.incoming('/艾莉丝 帮我写程序'));
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM dot_requests').get().n,0);
   assert.equal(f.store.request(pending.id).status,'pending');
@@ -59,7 +60,7 @@ test('subscription requires verified OpenAI callback, persists and renews withou
 
 test('one owner event grants native creation only once, binds a real fresh root and cannot change or reuse a work chat',async t=>{
   const f=fixture(t);f.dot.configure({enabled:true});await f.subscribe();
-  const inbound=f.incoming('/dot 新建测试工作');await f.bridge.receive(inbound);await f.bridge.receive(inbound);
+  const inbound=f.incoming('/新任务 新建测试工作');await f.bridge.receive(inbound);await f.bridge.receive(inbound);
   const msg=f.store.db.prepare('SELECT id FROM dot_requests').get().id;
   assert.equal(f.dot.prepare({message_id:msg,action:'create'}).claimed_now,true);
   assert.equal(f.dot.prepare({message_id:msg,action:'create'}).claimed_now,false);
@@ -67,7 +68,7 @@ test('one owner event grants native creation only once, binds a real fresh root 
   const a=f.dot.bind({message_id:msg,session_id:A});assert.equal(a.number,1);
   assert.equal(f.dot.bind({message_id:msg,session_id:A}).duplicate,true);
   assert.throws(()=>f.dot.bind({message_id:msg,session_id:B}));
-  await f.bridge.receive(f.incoming('/dot 另一个独立工作'));const second=f.store.db.prepare('SELECT id FROM dot_requests WHERE id<>?').get(msg).id;
+  await f.bridge.receive(f.incoming('/新任务 另一个独立工作'));const second=f.store.db.prepare('SELECT id FROM dot_requests WHERE id<>?').get(msg).id;
   f.dot.prepare({message_id:second,action:'create'});assert.throws(()=>f.dot.bind({message_id:second,session_id:A}));
   f.metadata.get(B).created_at-=60;assert.throws(()=>f.dot.bind({message_id:second,session_id:B}));
   f.metadata.get(B).created_at+=60;assert.equal(f.dot.bind({message_id:second,session_id:B}).number,2);
@@ -75,9 +76,9 @@ test('one owner event grants native creation only once, binds a real fresh root 
 
 test('related work can continue only the explicitly prepared managed chat; main completion still goes through one gateway and children stay silent',async t=>{
   const f=fixture(t);f.dot.configure({enabled:true});await f.subscribe();await f.subscribe('task.completed');
-  await f.bridge.receive(f.incoming('/dot 新建'));const id=f.store.db.prepare('SELECT id FROM dot_requests').get().id;
+  await f.bridge.receive(f.incoming('/新任务 新建'));const id=f.store.db.prepare('SELECT id FROM dot_requests').get().id;
   f.dot.prepare({message_id:id,action:'create'});f.dot.bind({message_id:id,session_id:A});
-  await f.bridge.receive(f.incoming('/dot 继续这个工作'));const next=f.store.db.prepare('SELECT id FROM dot_requests WHERE id<>?').get(id).id;
+  await f.bridge.receive(f.incoming('/艾莉丝 继续任务 1 继续这个工作'));const next=f.store.db.prepare('SELECT id FROM dot_requests WHERE id<>?').get(id).id;
   assert.throws(()=>f.dot.prepare({message_id:next,action:'continue',session_id:B}));
   f.dot.prepare({message_id:next,action:'continue',session_id:A});assert.throws(()=>f.dot.bind({message_id:next,session_id:B}));f.dot.bind({message_id:next,session_id:A});
   const payload={type:'agent-turn-complete','thread-id':A,'turn-id':'same-turn','last-assistant-message':'完成'};
@@ -107,7 +108,7 @@ test('callback validation blocks local, private, mapped and documentation addres
 
 test('RPC exposes only curated dispatch tools and request text, and worker status is scoped to its original chat',async t=>{
   const f=fixture(t);f.dot.configure({enabled:true});await f.subscribe();
-  f.bridge.ask({session_id:A,request_key:'a',questions:[{id:'a',question:'A 的问题'}]});f.bridge.ask({session_id:B,request_key:'b',questions:[{id:'b',question:'B 的问题'}]});
+  f.bridge.ask({presentation:'chat_text',session_id:A,request_key:'a',questions:[{id:'a',question:'A 的问题'}]});f.bridge.ask({presentation:'chat_text',session_id:B,request_key:'b',questions:[{id:'b',question:'B 的问题'}]});
   assert.equal(f.bridge.status(A).pending.length,1);assert.equal(f.bridge.status(A).pending[0].questions[0].question,'A 的问题');
   const discovered=await f.dot.rpc({jsonrpc:'2.0',id:1,method:'server/discover'});assert.deepEqual(discovered.result.supportedVersions,['2026-07-28']);
   const status=await f.dot.rpc({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'dot_bridge_status',arguments:{}}});assert.equal(JSON.stringify(status).includes('A 的问题'),false);
@@ -136,7 +137,7 @@ test('callback key rotation overlaps signatures; replacing the coordinator and r
 
 test('a fast task completion before binding still reaches Dot once; a Dot failure cannot suppress the main WeChat completion',async t=>{
   const f=fixture(t);f.dot.configure({enabled:true});await f.subscribe();await f.subscribe('task.completed');
-  await f.bridge.receive(f.incoming('/dot 很快完成的工作'));const id=f.store.db.prepare('SELECT id FROM dot_requests').get().id;f.dot.prepare({message_id:id,action:'create'});
+  await f.bridge.receive(f.incoming('/新任务 很快完成的工作'));const id=f.store.db.prepare('SELECT id FROM dot_requests').get().id;f.dot.prepare({message_id:id,action:'create'});
   f.bridge.notify({type:'agent-turn-complete','thread-id':A,'turn-id':'fast','last-assistant-message':'结果'});f.dot.bind({message_id:id,session_id:A});
   assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM dot_deliveries WHERE body LIKE '%task.completed%'").get().n,1);
   f.bridge.dot.completed=()=>{throw new Error('Simulated isolated Dot failure');};
@@ -146,7 +147,7 @@ test('a fast task completion before binding still reaches Dot once; a Dot failur
 
 test('real worker MCP neither reveals another chat’s pending questions nor accepts a spoofed question destination',async t=>{
   const f=fixture(t,false),app=await serve({state:f.dir,port:0,bridge:f.bridge,listen:false,dotVault:f.vault,dotWebhook:f.webhook});
-  const a=f.bridge.ask({session_id:A,request_key:'a',questions:[{id:'a',question:'A 私有问题'}]}),b=f.bridge.ask({session_id:B,request_key:'b',questions:[{id:'b',question:'B 私有问题'}]});
+  const a=f.bridge.ask({presentation:'chat_text',session_id:A,request_key:'a',questions:[{id:'a',question:'A 私有问题'}]}),b=f.bridge.ask({presentation:'chat_text',session_id:B,request_key:'b',questions:[{id:'b',question:'B 私有问题'}]});
   const env={...process.env,CODEX_WECHAT_STATE:f.dir,CODEX_THREAD_ID:A};delete env.CODEX_APP_TOOLS_PIPE_PATH;
   const child=spawn(process.execPath,[path.join(ROOT,'src','mcp.mjs')],{env,windowsHide:true,stdio:['pipe','pipe','pipe']});child.stderr.resume();
   const lines=readline.createInterface({input:child.stdout}),pending=new Map();let id=0;
@@ -157,6 +158,23 @@ test('real worker MCP neither reveals another chat’s pending questions nor acc
   assert.equal((await rpc('check_answer',{request_id:b.id})).result.isError,true);
   assert.equal((await rpc('ask_user',{session_id:B,questions:[{id:'bad',question:'误投'}]})).result.isError,true);
   assert.equal(f.store.pending().length,2);
+});
+
+test('new Dot work remains native and silent, including completion before binding; direct conversation still replies',async t=>{
+  const f=fixture(t);f.store.setChatMode(A,'native');f.dot.configure({enabled:true});await f.subscribe();await f.subscribe('task.completed');
+  await f.bridge.receive(f.incoming('/新任务 默认不通知的任务'));
+  const row=f.store.db.prepare("SELECT * FROM dot_requests WHERE intent='task'").get();f.dot.prepare({message_id:row.id,action:'create'});
+  assert.equal(f.dot.reply({message_id:row.id,update_key:'progress',text:'开始工作'}).suppressed,'chat_mode_native');
+  f.bridge.notify({type:'agent-turn-complete','thread-id':A,'turn-id':'fast-native','last-assistant-message':'不发到微信的结果'});
+  assert.equal(f.store.tasks().length,0);
+  f.dot.bind({message_id:row.id,session_id:A});assert.equal(f.store.taskForSession(A).state,'completed');assert.equal(f.store.chatMode(A),'native');
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM outbox WHERE event_key LIKE 'dot-bound:%' OR event_key LIKE 'dot-reply:%' OR kind='completion'").get().n,0);
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM dot_deliveries WHERE body LIKE '%task.completed%'").get().n,0);
+  await f.bridge.receive(f.incoming('/艾莉丝 对话 你好'));
+  const chat=f.store.db.prepare("SELECT * FROM dot_requests WHERE intent='conversation'").get();f.dot.reply({message_id:chat.id,update_key:'one',text:'你好'});
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM outbox WHERE event_key LIKE 'dot-chat-reply:%'").get().n,1);
+  f.store.setChatMode(A,'wechat');f.bridge.notify({type:'agent-turn-complete','thread-id':A,'turn-id':'explicit','last-assistant-message':'明确开启后通知'});
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='completion'").get().n,1);
 });
 
 test('live subscription diagnostics record only known method names and outcomes, never secrets or callback paths',async t=>{
