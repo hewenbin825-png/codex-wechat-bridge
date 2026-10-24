@@ -10,8 +10,10 @@ export async function handleHook(input, { api = localApi, state = STATE, skillPa
   if (event === 'SessionStart') {
     await wake();
     await api('/api/events', { event, ...context }, { timeout: 1000 }).catch(() => {});
-    let skill='';try{skill=fs.readFileSync(skillPath,'utf8').replace(/^---[\s\S]*?---\s*/,'').slice(0,6500);}catch{}
-    return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `自动应用全局 wechat-task-qa skill，无需用户再提到微信。普通问询同时允许微信和电脑本地回答，先收到的有效答案生效。优先使用 mcp__wechat_bridge__ask_user 的双端问答；不拦截电脑原生提问。已答题仍可用“题号.补充文字”投递原聊天。仅主任务完成通知，子智能体完成不通知。session_id=${context.session_id}。服务不可用时直接在 Codex 提问，不能把超时或错误当作回答。执行权限审批继续使用 Codex 原审批。\n${skill}` } };
+    const status=await api(`/api/status?session_id=${encodeURIComponent(context.session_id)}`,undefined,{timeout:1000}).catch(()=>null);
+    const enabled=status?.chat_mode==='wechat';
+    let skill='';if(enabled)try{skill=fs.readFileSync(skillPath,'utf8').replace(/^---[\s\S]*?---\s*/,'').slice(0,6500);}catch{}
+    return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `微信模式按聊天单独保存，默认关闭，不能因全局 skill 或其他聊天开启而自动启用。session_id=${context.session_id}。当前模式=${enabled?'wechat':'native'}${status?'':'（服务状态未确认）'}。${enabled?'本聊天已开启微信模式：普通问题以聊天中的醒目文字及微信提醒呈现，不调用原生问题卡，不使用 computer-use 回填。手机答案投递原聊天，电脑直接文字回答用 answer_from_chat 记录，先到有效答案生效。仅本聊天主任务完成发通知。':'使用 Codex 原始问题选择卡，不发微信问询或完成通知。只有用户在本聊天明确要求微信通知时，应用 wechat-task-qa 并用 set_chat_mode 开启。'}新聊天和分叉不继承开关；执行审批始终使用 Codex 原流程。\n${skill}` } };
   }
   if (event === 'PreToolUse') {
     const name = String(input.tool_name || '');

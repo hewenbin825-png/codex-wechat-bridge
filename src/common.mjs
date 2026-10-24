@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const VERSION = '2.0.0';
+export const VERSION = '2.1.0';
 export const STATE = process.env.CODEX_WECHAT_STATE || path.join(ROOT, 'state');
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const randomId = () => crypto.randomUUID();
@@ -36,7 +36,9 @@ export function summary(text, limit = 180) {
   return chars.slice(0, limit).join('') + (chars.length > limit ? '…' : '');
 }
 export function stateConfig(state = STATE) {
-  return readJson(path.join(state, 'connection.json'), { port: 17349 });
+  const config=readJson(path.join(state, 'connection.json'));
+  if(!config||!Number.isInteger(config.port)||config.port<1||config.port>65535)throw Object.assign(new Error('Owned service connection is not ready'),{code:'CONNECTION_NOT_READY'});
+  return config;
 }
 export async function localApi(route, body, { state = STATE, signal, timeout = 35000 } = {}) {
   const cfg = stateConfig(state);

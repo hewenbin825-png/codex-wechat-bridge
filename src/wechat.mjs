@@ -46,7 +46,13 @@ export class WeChatApi {
     let result;
     try { result = parseWireJson(raw); } catch { throw Object.assign(new Error('Invalid WeChat response'), { code: 'INVALID_JSON', uncertain: true }); }
     const failure = [result.ret, result.errcode].find(x => x !== undefined && x !== null && Number(x) !== 0);
-    if (failure !== undefined) throw Object.assign(new Error('WeChat rejected request'), { code: `ILINK_${failure}`, deferred: true, expired: Number(failure) === -14 });
+    if (failure !== undefined) {
+      // A generic rejection or rate limit does not prove the context is expired.
+      // Keep server text out of diagnostics; retain only this narrow classification.
+      const contextInvalid = /context[_\s-]?token|上下文(?:令牌|凭证)/i.test(String(result.errmsg || ''))
+        && /expired|invalid|expire|过期|失效|无效/i.test(String(result.errmsg || ''));
+      throw Object.assign(new Error('WeChat rejected request'), { code: `ILINK_${failure}`, deferred: true, expired: Number(failure) === -14, contextInvalid });
+    }
     return result;
   }
   startLogin(localTokens = []) { return this.call('get_bot_qrcode', { body: { local_token_list: localTokens.slice(0, 10) }, query: '?bot_type=3' }); }

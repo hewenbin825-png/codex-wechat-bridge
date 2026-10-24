@@ -8,6 +8,7 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, updated INTEGER);
+      CREATE TABLE IF NOT EXISTS chat_modes (session_id TEXT PRIMARY KEY, mode TEXT NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, request_key TEXT UNIQUE, session_id TEXT, turn_id TEXT, title TEXT, questions TEXT, answers TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, created INTEGER, expires INTEGER, lease INTEGER);
       CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, event_key TEXT UNIQUE, kind TEXT, request_id TEXT, peer TEXT, text TEXT, state TEXT NOT NULL, created INTEGER, expires INTEGER, attempts INTEGER DEFAULT 0, error TEXT, sent INTEGER, client_id TEXT);
       CREATE TABLE IF NOT EXISTS inbound (id TEXT PRIMARY KEY, received INTEGER);
@@ -19,6 +20,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, time INTEGER, event TEXT, details TEXT);`);
     if (!this.db.prepare('PRAGMA table_info(requests)').all().some(c=>c.name==='local_available')) this.db.exec('ALTER TABLE requests ADD COLUMN local_available INTEGER NOT NULL DEFAULT 0');
     if (!this.db.prepare('PRAGMA table_info(requests)').all().some(c=>c.name==='question_epoch')) this.db.exec('ALTER TABLE requests ADD COLUMN question_epoch INTEGER NOT NULL DEFAULT 0');
+    if (!this.db.prepare('PRAGMA table_info(requests)').all().some(c=>c.name==='presentation')) this.db.exec("ALTER TABLE requests ADD COLUMN presentation TEXT NOT NULL DEFAULT 'legacy'");
+    if (!this.db.prepare('PRAGMA table_info(outbox)').all().some(c=>c.name==='session_id')) this.db.exec("ALTER TABLE outbox ADD COLUMN session_id TEXT NOT NULL DEFAULT ''");
+    if (!this.db.prepare('PRAGMA table_info(continuations)').all().some(c=>c.name==='kind')) this.db.exec("ALTER TABLE continuations ADD COLUMN kind TEXT NOT NULL DEFAULT 'continuation'");
     if (!this.db.prepare('PRAGMA table_info(continuations)').all().some(c=>c.name==='question_number')) this.db.exec('ALTER TABLE continuations ADD COLUMN question_number INTEGER');
     if (!this.db.prepare('PRAGMA table_info(continuations)').all().some(c=>c.name==='task_epoch')) this.db.exec('ALTER TABLE continuations ADD COLUMN task_epoch INTEGER NOT NULL DEFAULT 0');
     // A process can die after send acceptance; do not blindly resend that record.
@@ -50,16 +54,30 @@ export class Store {
     this.db.prepare('INSERT INTO sessions VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET cwd=CASE WHEN excluded.cwd=\'\' THEN sessions.cwd ELSE excluded.cwd END,title=CASE WHEN excluded.title=\'\' THEN sessions.title ELSE excluded.title END,updated=excluded.updated').run(id, cwd, title, this.clock());
   }
   sessionTitle(id) { return this.db.prepare('SELECT title,cwd FROM sessions WHERE id=?').get(id); }
+  chatMode(session) { return this.db.prepare('SELECT mode FROM chat_modes WHERE session_id=?').get(session)?.mode || 'native'; }
+  setChatMode(session,mode) {
+    if(!session||!['native','wechat'].includes(mode))throw new Error('Invalid chat mode');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO chat_modes VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,updated=excluded.updated').run(session,mode,this.clock());
+      if(mode==='native'){
+        this.cancelSession(session);
+        this.db.prepare("UPDATE outbox SET state='cancelled' WHERE session_id=? AND state IN ('queued','deferred')").run(session);
+        this.db.prepare("UPDATE continuations SET state='cancelled',prompt='',error='CHAT_MODE_DISABLED' WHERE session_id=? AND state='queued' AND kind='question_answer'").run(session);
+      }
+      this.db.exec('COMMIT');return {session_id:session,mode};
+    }catch(e){this.db.exec('ROLLBACK');throw e;}
+  }
   tasks() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number=?').get(number); }
   taskForSession(session) { return this.db.prepare('SELECT * FROM tasks WHERE session_id=?').get(session); }
-  completeTask(session, turn, title, cwd = '') {
+  completeTask(session, turn, title, cwd = '', {allocate=true} = {}) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const added = this.db.prepare('INSERT OR IGNORE INTO task_completions VALUES (?,?)').run(session, turn).changes;
       if (added) {
         if(this.taskForSession(session))this.db.prepare("UPDATE tasks SET title=?,cwd=?,state='completed',last_turn=?,completed=?,updated=? WHERE session_id=?").run(title,cwd,turn,this.clock(),this.clock(),session);
-        else this.db.prepare("INSERT INTO tasks(session_id,title,cwd,state,last_turn,completed,updated) VALUES (?,?,?,'completed',?,?,?)").run(session,title,cwd,turn,this.clock(),this.clock());
+        else if(allocate)this.db.prepare("INSERT INTO tasks(session_id,title,cwd,state,last_turn,completed,updated) VALUES (?,?,?,'completed',?,?,?)").run(session,title,cwd,turn,this.clock(),this.clock());
       }
       const task = this.db.prepare('SELECT * FROM tasks WHERE session_id=?').get(session);
       this.db.exec('COMMIT'); return { task, duplicate: !added };
@@ -110,7 +128,7 @@ export class Store {
     return row;
   }
   staleContinuations() {
-    const stale = this.db.prepare("SELECT * FROM continuations WHERE (state='queued' AND created<?) OR (state='dispatching' AND updated<?)").all(this.clock() - 120000, this.clock() - 90000);
+    const stale = this.db.prepare("SELECT * FROM continuations WHERE (state='queued' AND created<? AND kind<>'question_answer') OR (state='queued' AND created<? AND kind='question_answer') OR (state='dispatching' AND updated<?)").all(this.clock() - 120000, this.clock() - 86400000, this.clock() - 90000);
     for (const row of stale) {
       if (row.state === 'queued') this.db.prepare("UPDATE continuations SET state='dispatching',worker_id='expired' WHERE id=?").run(row.id);
       this.finishContinuation(row.id, row.worker_id || 'expired', row.state === 'queued' ? 'expired' : 'uncertain', 'DISPATCH_TIMEOUT');
@@ -123,7 +141,7 @@ export class Store {
   }
   byKey(key) { const row = this.db.prepare('SELECT id FROM requests WHERE request_key=?').get(key); return row && this.request(row.id); }
   pending() { this.sweep(); return this.db.prepare("SELECT id FROM requests WHERE status='pending' ORDER BY created").all().map(r => this.request(r.id)); }
-  createRequest({ request_key, session_id, turn_id = '', title = '', questions, ttl_ms = 86400000, local_available = false }) {
+  createRequest({ request_key, session_id, turn_id = '', title = '', questions, ttl_ms = 86400000, local_available = false, presentation = 'legacy' }) {
     const existing = this.byKey(request_key); if (existing) return existing;
     if (!Array.isArray(questions) || !questions.length || questions.length > 3) throw new Error('需要 1–3 道问题');
     const ids = new Set();
@@ -144,6 +162,7 @@ export class Store {
     this.db.prepare('INSERT INTO requests(id,request_key,session_id,turn_id,title,questions,status,created,expires,lease) VALUES (?,?,?,?,?,?,\'pending\',?,?,?)')
       .run(id, request_key, session_id, turn_id, summary(title, 40), JSON.stringify(normalized), at, at + Math.min(Math.max(ttl_ms, 60000), 86400000), at + 90000);
     this.db.prepare('UPDATE requests SET local_available=?,question_epoch=? WHERE id=?').run(local_available ? 1 : 0,Number(this.meta('question_epoch')||0),id);
+    this.db.prepare('UPDATE requests SET presentation=? WHERE id=?').run(presentation,id);
     this.audit('question_created', { id, count: normalized.length });
     return this.request(id);
   }
@@ -176,7 +195,7 @@ export class Store {
   }
   sweep() {
     const at = this.clock();
-    const stale = this.db.prepare("SELECT id FROM requests WHERE status='pending' AND (expires<=? OR lease<=?)").all(at, at);
+    const stale = this.db.prepare("SELECT id FROM requests WHERE status='pending' AND (expires<=? OR (presentation<>'chat_text' AND lease<=?))").all(at, at);
     for (const r of stale) this.cancel(r.id, 'expired');
     this.db.prepare("UPDATE outbox SET state='expired' WHERE state IN ('queued','deferred') AND expires<=?").run(at);
   }
@@ -192,15 +211,20 @@ export class Store {
     const done = r.questions.every(x => r.answers[x.id]);
     this.db.prepare('UPDATE requests SET answers=?,status=? WHERE id=? AND status=\'pending\'').run(JSON.stringify(r.answers), done ? 'answered' : 'pending', r.id);
     this.db.prepare("UPDATE outbox SET state='cancelled' WHERE event_key=? AND state IN ('queued','deferred')").run(`question:${r.id}:${q.id}`);
+    if(source==='wechat'&&r.presentation==='chat_text'){
+      this.db.prepare("INSERT OR IGNORE INTO continuations(id,inbound_id,task_number,session_id,prompt,state,created,updated,question_number,task_epoch,kind) VALUES (?,?,NULL,?,?,'queued',?,?,?,?,'question_answer')")
+        .run(randomId(),`answer:${r.id}:${q.id}`,r.session_id,`【本人微信回答｜第${q.number}题】\n问题：${q.question}\n答案：${text}\n此为该普通问题的真实回答，不能作为执行权限审批。请求 ID：${r.id}`,this.clock(),this.clock(),q.number,Number(this.meta('task_epoch')||0));
+    }
     this.audit('question_answered', { id: r.id, question_id: q.id, complete: done,source });
     this.db.exec('COMMIT');
     return true;
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }
-  enqueue({ key, kind = 'completion', request_id = '', peer, text, ttl_ms = 86400000 }) {
+  enqueue({ key, kind = 'completion', request_id = '', peer, text, ttl_ms = 86400000, session_id = '' }) {
     const id = randomId(), at = this.clock();
     this.db.prepare('INSERT OR IGNORE INTO outbox(id,event_key,kind,request_id,peer,text,state,created,expires,client_id) VALUES (?,?,?,?,?,?,\'queued\',?,?,?)')
       .run(id, key, kind, request_id, peer, text, at, at + ttl_ms, `codex-wechat-${id}`);
+    if(session_id)this.db.prepare('UPDATE outbox SET session_id=? WHERE id=?').run(session_id,id);
     return this.db.prepare('SELECT id,state FROM outbox WHERE event_key=?').get(key);
   }
   next(peer) {
@@ -211,6 +235,10 @@ export class Store {
   sending(id) { this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='queued'").run(id); }
   failed(id, state, code) { this.db.prepare('UPDATE outbox SET state=?,error=? WHERE id=?').run(state, code, id); }
   reactivate(peer) { this.db.prepare("UPDATE outbox SET state='queued',error=NULL WHERE peer=? AND state='deferred'").run(peer); }
+  retryRateLimited(peer) {
+    this.sweep();
+    this.db.prepare("UPDATE outbox SET state='queued' WHERE peer=? AND state='deferred' AND error='HTTP_429' AND attempts<3 AND expires>? AND (kind<>'question' OR EXISTS (SELECT 1 FROM requests WHERE requests.id=outbox.request_id AND requests.status='pending'))").run(peer,this.clock());
+  }
   stats() {
     this.sweep();
     return { outbox: this.db.prepare('SELECT state,count(*) AS count FROM outbox GROUP BY state').all(), last_sent: this.db.prepare('SELECT max(sent) AS time FROM outbox').get().time,
@@ -227,8 +255,17 @@ export class Store {
 }
 
 export function questionMessage(request, q) {
-  return `【${request.title || 'Codex 等待回答'}】\n第${q.number}题：${q.question}\n` + q.options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
+  return `【艾莉丝提醒｜${request.title || 'Codex 等待回答'}】\n第${q.number}题：${q.question}\n` + q.options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
     + `\n微信或电脑均可回答，先收到的有效答案生效。单题直接回数字或文字；多题回「${q.number}.1」或「${q.number}.你的文字」。答完仍可发「${q.number}.补充内容」。`;
+}
+
+export function questionMarkdown(request) {
+  return request.questions.filter(q=>!request.answers[q.id]).map(q=>[
+    `> **待你回答｜第${q.number}题${request.title?' · '+request.title:''}**`,
+    ...q.question.split('\n').map(line=>`> ${line}`),'>',
+    ...q.options.map((o,i)=>`> ${i+1}. ${o.label}${o.description?' — '+o.description:''}`),'>',
+    `> 可直接在此聊天或微信回复；多题请用「${q.number}.选项或文字」。`
+  ].join('\n')).join('\n\n');
 }
 
 export function resolveReply(pending, raw, createdAt = Date.now()) {

@@ -27,6 +27,7 @@ export class Bridge extends EventEmitter {
       needs_activation: !!this.creds && !this.creds.contextToken, needs_login: !!this.creds?.invalid,
       account: this.creds ? hash(this.creds.peer).slice(0, 8) : null, last_inbound: this.creds?.lastInbound || null,
       error: this.error, login: this.login ? { id: this.login.id, status: this.login.status, started: this.login.started } : null,
+      chat_mode:session?this.store.chatMode(session):null, question_presentation:session&&this.store.chatMode(session)==='wechat'?'chat_text':'codex_native',
       pending, tasks: this.store.tasks().filter(t=>!session||t.session_id===session).map(({number,title,state}) => ({number,title,state})),
       desktop_connector: { ready: !!this.desktop?.ready() }, ...this.store.stats() };
   }
@@ -73,7 +74,7 @@ export class Bridge extends EventEmitter {
     }
     const text = (message.item_list || []).filter(x => Number(x.type) === 1).map(x => x.text_item?.text || '').join('\n').trim();
     if (!text) return { ignored: true };
-    const pending = this.store.pending(), tasks = this.routingTasks();
+    const pending = this.store.pending().filter(r=>this.store.chatMode(r.session_id)==='wechat'), tasks = this.routingTasks();
     const command = text.replace(/^\//, '').toLowerCase();
     let receipt;const clearing=clearCommand(text),createdAt=Number(message.create_time_ms)||this.clock(),resetAt=Number(this.store.meta('question_reset_at')||0);
     if(clearing){
@@ -81,7 +82,7 @@ export class Bridge extends EventEmitter {
       else if(resetAt&&createdAt<resetAt)receipt='这是清理前的旧 /clear 消息，未再次清理当前问题。';
       else {const cleared=this.store.clearQuestions();this.emit('changed');receipt=`已清空题号和任务号，取消 ${cleared.pending_questions} 道待答问题。下一道问题和下一个新分配的任务都从 1 开始。\n旧题号和旧任务号入口已失效，未投递的编号提示词已取消。请只使用清理后新消息里的编号。工作聊天、历史和完成去重记录保留，已执行中的工作继续。`;}
     } else if (['激活', '连接', 'ping', '收到', '帮助', 'help', '状态', 'status'].includes(command)) {
-      receipt = `Codex 微信通道已激活。${pending.length ? `当前有 ${pending.length} 组待答问题，发送「待答」查看。` : '当前没有待答问题。'}\n完成通知仅限主任务。发送「/任务」查看任务；「/任务号 下一步要求」续办；「/clear」清空题号和任务号并从 1 开始。普通文字只回答待答问题。`;
+      receipt = `Codex 微信通道已激活。${pending.length ? `当前有 ${pending.length} 组待答问题，发送「待答」查看。` : '当前没有待答问题。'}\n完成通知仅限主任务。发送「/任务」查看任务；「/任务号 下一步要求」续办；「/clear」重置题号和任务号。发送「/艾莉丝 对话」聊天；「/艾莉丝 创建任务 具体要求」才建立任务。连续对话中普通文字仍优先回答待答问题。`;
       this.store.meta('live_inbound_verified', 'true');
     } else if (['待答', 'pending'].includes(command)) {
       receipt = pending.length ? pending.flatMap(r => r.questions.filter(q => !r.answers[q.id]).map(q => `第${q.number}题｜${r.title || 'Codex'}：${q.question}`)).join('\n').slice(0, 3000) : '当前没有待答问题。';
@@ -111,7 +112,11 @@ export class Bridge extends EventEmitter {
         const after = this.store.request(resolved.request.id);
         receipt = `已记录第${resolved.question.number}题。${after.status === 'answered' ? '答案正在返回原聊天。' : '请继续回答其他问题。'}\n后续补充仍可发送「${resolved.question.number}.补充内容」。`;
         this.store.meta('live_answer_verified', 'true'); this.emit('answer', resolved.request.id);
-      } else receipt = await this.questionSupplement(text,id,Number(message.create_time_ms)||this.clock()) || resolved.reason || '这道问题已处理，未重复提交。';
+      } else {
+        const supplement=await this.questionSupplement(text,id,Number(message.create_time_ms)||this.clock());
+        const numbered=/^[（(]?\s*\d+(?:\s*[.．。，,]|\s*[）)]?$)/.test(text);
+        receipt=supplement||(!pending.length&&!numbered&&!text.startsWith('/')&&this.dot?.dialogueActive()?this.dot.receiveConversation(text,id):null)||resolved.reason||'这道问题已处理，未重复提交。';
+      }
     }
     this.store.enqueue({ key: `receipt:${id}`, kind: 'receipt', peer: this.creds.peer, text: receipt, ttl_ms: 3600000 });
     return { accepted: true };
@@ -140,6 +145,7 @@ export class Bridge extends EventEmitter {
     if(!match||/^\d+$/.test(match[2].trim()))return null;
     const found=this.store.questionByNumber(Number(match[1]));if(!found)return null;
     const {request,question}=found,prompt=match[2].trim();
+    if(this.store.chatMode(request.session_id)!=='wechat')return '该原聊天已关闭微信模式，请在电脑原聊天补充。';
     if(!request.answers[question.id]||!['pending','answered'].includes(request.status))return null;
     if(prompt.length>8000)return '补充内容不能超过 8000 字符。';
     if(createdAt<request.answers[question.id].received_at-5000)return '这条补充早于已记录答案，尚未提交。请重新发送。';
@@ -162,7 +168,7 @@ export class Bridge extends EventEmitter {
     if(!['local','codex'].includes(source))throw Object.assign(new Error('回答来源无效'),{status:400});
     const accepted=this.store.answer(requestId,question,answer,randomId(),source);
     if(accepted){
-      if(this.creds)this.store.enqueue({key:`local-answer:${requestId}:${question.id}`,kind:'receipt',peer:this.creds.peer,text:`第${question.number}题已在电脑端回答，答案正在返回原聊天。后续可发送「${question.number}.补充内容」。`,ttl_ms:3600000});
+      if(this.creds&&this.store.chatMode(request.session_id)==='wechat')this.store.enqueue({key:`local-answer:${requestId}:${question.id}`,kind:'receipt',session_id:request.session_id,peer:this.creds.peer,text:`第${question.number}题已在电脑端回答。后续可发送「${question.number}.补充内容」。`,ttl_ms:3600000});
       this.emit('answer',requestId);
     }
     return {accepted,request:this.store.request(requestId)};
@@ -182,8 +188,14 @@ export class Bridge extends EventEmitter {
   }
   async drainOnce() {
     if (this.sending || !this.ready()) return;
+    this.store.retryRateLimited(this.creds.peer);
     const record = this.store.next(this.creds.peer); if (!record) return;
+    const sourceSession=record.session_id||(record.kind==='question'?this.store.request(record.request_id)?.session_id:record.kind==='completion'?/^completion:([^:]+):/.exec(record.event_key)?.[1]:'');
+    if((sourceSession&&this.store.chatMode(sourceSession)!=='wechat')||(record.kind==='completion'&&!sourceSession)||(record.kind==='question'&&this.store.request(record.request_id)?.presentation!=='chat_text')){
+      this.store.failed(record.id,'cancelled','CHAT_MODE_DISABLED');return;
+    }
     this.sending = true; this.store.sending(record.id);
+    const activeCreds=this.creds, sentContext=activeCreds.contextToken;
     try {
       await this.api.send(this.creds, record.text, record.client_id, this.abort.signal);
       this.store.sent(record.id); this.error = null; this.store.audit('message_sent', { id: record.id, kind: record.kind });
@@ -194,16 +206,35 @@ export class Bridge extends EventEmitter {
       this.error = safeError(e); this.store.audit('message_failed', { id: record.id, kind: record.kind, state, ...safeError(e) });
       this.blockedUntil = this.clock() + 30000;
       if (record.kind === 'question') { if(!this.store.request(record.request_id)?.local_available)this.store.cancel(record.request_id, 'unavailable'); this.emit('changed'); }
-      if (e.deferred) { this.creds.contextToken = ''; if (e.expired) this.creds.invalid = true; await this.persist(); }
+      if ((e.expired || e.contextInvalid) && this.creds===activeCreds && this.creds.contextToken===sentContext) {
+        this.creds.contextToken = ''; if (e.expired) this.creds.invalid = true; await this.persist();
+      }
     } finally { this.sending = false; }
   }
   ask(args) {
+    if(this.store.chatMode(args.session_id)!=='wechat')throw Object.assign(new Error('This chat uses original Codex questions. Enable WeChat only after an explicit request in this chat.'),{code:'CHAT_MODE_NATIVE',status:409});
+    if(args.presentation!=='chat_text')throw Object.assign(new Error('Reload the WeChat MCP connection for text-only questions; native bridge forms are no longer used.'),{code:'CLIENT_RELOAD_REQUIRED',status:409});
     if (!this.ready()&&!args.local_available) throw Object.assign(new Error('微信尚未就绪。请在 Codex 内直接提问；可在本机管理页绑定，或在微信发送“激活”。'), { code: 'WECHAT_UNAVAILABLE', status: 409 });
-    const existing = this.store.byKey(args.request_key); if (existing) return existing;
+    const existing = this.store.byKey(args.request_key); if (existing) {if(existing.session_id!==args.session_id)throw Object.assign(new Error('Question belongs to another chat'),{code:'WRONG_CHAT',status:403});return existing;}
     if (this.store.pending().length >= 100) throw Object.assign(new Error('待答问题过多'), { status: 429, code: 'TOO_MANY_PENDING' });
     const request = this.store.createRequest(args);
-    if(this.ready())for (const q of request.questions) this.store.enqueue({ key: `question:${request.id}:${q.id}`, kind: 'question', request_id: request.id, peer: this.creds.peer, text: questionMessage(request, q) });
+    if(this.creds)for (const q of request.questions) this.store.enqueue({ key: `question:${request.id}:${q.id}`, kind: 'question', request_id: request.id, session_id:request.session_id,peer: this.creds.peer, text: questionMessage(request, q) });
     return request;
+  }
+  setChatMode({session_id,mode}) {
+    const meta=this.sessionLookup(session_id);
+    if(!meta?.root||meta.archived)throw Object.assign(new Error('A current root chat is required'),{code:'INVALID_CHAT',status:403});
+    const result=this.store.setChatMode(session_id,mode);this.emit('changed');return {...result,question_presentation:mode==='wechat'?'chat_text':'codex_native'};
+  }
+  answerFromChat({session_id,request_id,question_id,text}) {
+    const request=this.store.request(request_id);
+    if(!request||request.session_id!==session_id)throw Object.assign(new Error('Question belongs to another chat'),{code:'WRONG_CHAT',status:403});
+    const question=request.questions.find(q=>q.id===question_id);
+    if(!question)throw Object.assign(new Error('Unknown question'),{code:'UNKNOWN_QUESTION',status:404});
+    if(request.status!=='pending'||request.answers[question.id])return {accepted:false,request};
+    const resolved=resolveReply([{...request,questions:[question]}],text,this.clock());
+    if(!resolved.ok)throw Object.assign(new Error(resolved.reason),{code:'INVALID_ANSWER',status:400});
+    return this.answerLocal(request_id,{question_id,text:resolved.answer,source:'codex'});
   }
   notify(payload) {
     if (payload.type !== 'agent-turn-complete') return { ignored: true };
@@ -213,8 +244,14 @@ export class Bridge extends EventEmitter {
     // event can never allocate a task number or send a completion summary.
     const info = this.sessionLookup(session);
     if (payload.agent_id || payload.agent_type || payload.parent_thread_id || !info?.root) return { suppressed: 'not_main_task' };
+    if(this.store.chatMode(session)!=='wechat'){
+      // Record only turn identity/state, never its text or a new task number.
+      // This also handles a very fast Dot job that finishes before binding.
+      this.store.completeTask(session,turn||hash(summary(payload['last-assistant-message'])),summary(info.title||'Codex 工作',40),info.cwd||'',{allocate:false});
+      return {suppressed:'chat_mode_native'};
+    }
     this.store.session(session, String(payload.cwd || ''));
-    if (this.store.pending().some(r => r.session_id === session && (!r.turn_id || r.turn_id === turn))) return { suppressed: 'waiting_for_answer' };
+    if (this.store.pending().some(r => r.session_id === session && (r.presentation==='chat_text'||!r.turn_id||r.turn_id===turn))) return { suppressed: 'waiting_for_answer' };
     const meta = this.store.sessionTitle(session);
     const title = summary(info.title || this.titleLookup(session) || meta?.title || path.win32.basename(meta?.cwd || '') || `聊天 ${session.slice(0, 8)}`, 40);
     const key = turn || hash(summary(payload['last-assistant-message']));
@@ -222,13 +259,13 @@ export class Bridge extends EventEmitter {
     if (completion.duplicate) return { duplicate: true };
     try{this.dot?.completed(session,key,payload['last-assistant-message']);}catch(e){this.store.audit('dot_completion_event_error',safeError(e));}
     if (!this.creds || this.paused()) { this.store.audit('completion_not_forwarded', { reason: this.paused() ? 'paused' : 'not_paired', session: hash(session).slice(0, 8) }); return { skipped: true }; }
-    const text = `【任务 ${completion.task.number}｜${title}｜本轮结束】\n${summary(payload['last-assistant-message']) || '本轮已结束，请回 Codex 查看结果。'}\n下一步可发：/${completion.task.number} 继续任务\n只有一个可续办任务时，也可发 /继续任务。`;
-    return this.store.enqueue({ key: `completion:${session}:${key}`, peer: this.creds.peer, text });
+    const text = `【艾莉丝提醒｜任务 ${completion.task.number}｜${title}｜本轮结束】\n${summary(payload['last-assistant-message']) || '本轮已结束，请回 Codex 查看结果。'}\n下一步可发：/${completion.task.number} 继续任务\n只有一个可续办任务时，也可发 /继续任务。`;
+    return this.store.enqueue({ key: `completion:${session}:${key}`, session_id:session,peer: this.creds.peer, text });
   }
   event(data) {
     if (data.kind === 'notify') return this.notify(data.payload || {});
     if (data.event === 'SessionStart') { this.store.session(data.session_id, data.cwd || '', data.title || ''); this.store.audit('hook_session_start'); }
-    if (['Interrupt', 'SessionEnd'].includes(data.event)) { this.store.cancelSession(data.session_id, data.turn_id || ''); this.emit('changed'); }
+    if (['Interrupt', 'SessionEnd'].includes(data.event)) { for(const r of this.store.pending())if(r.session_id===data.session_id&&r.presentation!=='chat_text'&&(!data.turn_id||r.turn_id===data.turn_id))this.store.cancel(r.id);this.emit('changed'); }
     return { ok: true };
   }
   async close() {

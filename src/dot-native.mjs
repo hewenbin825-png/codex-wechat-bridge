@@ -24,12 +24,13 @@ export class DotNativeDispatch {
   row(id){return this.store.db.prepare('SELECT * FROM dot_native_jobs WHERE message_id=? AND owner=?').get(id,this.router.owner());}
   result(id){
     const request=this.router.request(id),job=this.row(id);
-    return {message_id:id,state:job?.state||'not_queued',session_id:request.session_id||job?.session_id||null,task_number:request.task_number||null,error:job?.error||'',
-      instruction:request.state==='bound'?'Use the returned Codex work chat. Do not create another chat.':'Read this request again if pending. Never repeat native creation after an uncertain result.'};
+    return {message_id:id,state:request.intent==='conversation'?'conversation_only':job?.state||'not_queued',session_id:request.session_id||job?.session_id||null,task_number:request.task_number||null,error:job?.error||'',
+      instruction:request.intent==='conversation'?'Reply directly with reply_to_owner. Do not create or continue a work chat.':request.state==='bound'?'Use the returned Codex work chat. Do not create another chat.':'Read this request again if pending. Never repeat native creation after an uncertain result.'};
   }
   enqueue(id){
     this.sweep();
     const request=this.router.request(id);
+    if(request.intent!=='task')throw new Error('Conversation or legacy request cannot start work; use reply_to_owner');
     if(this.row(id))return this.result(id);
     if(!this.ready())throw new Error('Native Codex dispatcher is not enabled and connected');
     if(request.state!=='prepared'||!['create','continue'].includes(request.action))throw new Error('Claim the owner request before dispatch');
@@ -37,6 +38,7 @@ export class DotNativeDispatch {
     return this.result(id);
   }
   async wait(id,timeout=15000){
+    if(this.router.request(id).intent!=='task')throw new Error('Conversation or legacy request cannot start work; use reply_to_owner');
     const deadline=Date.now()+Math.max(0,timeout);
     // An App Tools lease may renew a few seconds after its prior lease ends.
     // Wait inside this call only; never leave hidden work after an unready error.
@@ -51,7 +53,7 @@ export class DotNativeDispatch {
   claim(worker){
     if(!this.ready())return null;
     this.sweep();
-    const row=this.store.db.prepare("SELECT n.*,r.text,r.action,r.target FROM dot_native_jobs n JOIN dot_requests r ON n.message_id=r.id AND n.owner=r.owner WHERE n.owner=? AND n.state='queued' AND r.state='prepared' ORDER BY n.created LIMIT 1").get(this.router.owner());
+    const row=this.store.db.prepare("SELECT n.*,r.text,r.action,r.target FROM dot_native_jobs n JOIN dot_requests r ON n.message_id=r.id AND n.owner=r.owner WHERE n.owner=? AND n.state='queued' AND r.state='prepared' AND r.intent='task' ORDER BY n.created LIMIT 1").get(this.router.owner());
     if(!row)return null;
     if(row.action==='continue'){
       const meta=this.bridge.sessionLookup(row.target);
