@@ -3,11 +3,11 @@ param(
   [string]$NodePath = (Get-Command node.exe -ErrorAction Stop).Source,
   [string]$PythonPath = (Get-Command python.exe -ErrorAction Stop).Source,
   [switch]$NoAutostart,
-  [switch]$NoStart
+  [switch]$NoStart,
+  [switch]$StartNow
 )
 $ErrorActionPreference = 'Stop'
 $taskArgs = @((Join-Path $PSScriptRoot 'scripts\manage.py'), 'install', '--codex-home', $CodexHome, '--node', $NodePath)
-if (-not $NoAutostart) { $taskArgs += '--autostart' }
 & $PythonPath @taskArgs
 if ($LASTEXITCODE -ne 0) { throw 'Installation failed. The existing notification route was not replaced.' }
 $taskTarget = Join-Path $CodexHome 'codex-wechat-bridge'
@@ -28,6 +28,6 @@ if (-not $taskAclCorrect) {
   }
   Set-Acl -LiteralPath $taskTarget -AclObject $taskAcl
 }
-& (Join-Path $taskTarget 'scripts\service-task.ps1') -Action Install -AtLogon:(!$NoAutostart)
-if (-not $NoStart) { & (Join-Path $taskTarget 'start.ps1') }
-Write-Output 'Local files installed. Pair WeChat and check hook trust; use Codex /hooks only if review is requested.'
+& (Join-Path $taskTarget 'scripts\remove-logon-startup.ps1')
+if ($StartNow -and -not $NoStart) { & (Join-Path $taskTarget 'start.ps1') }
+Write-Output 'Installed without Windows startup tasks. Start Codex to connect in the background. New chats use original Codex questions until explicitly opted in.'
